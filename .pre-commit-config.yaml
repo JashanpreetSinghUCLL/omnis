@@ -1,0 +1,42 @@
+repos:
+  # Ruff: linting + formatting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Mypy: type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - pydantic>=2.8.0
+          - pydantic-settings>=2.4.0
+          - fastapi>=0.115.0
+        args: [--config-file=pyproject.toml]
+
+  # Pytest smoke test
+  - repo: local
+    hooks:
+      - id: pytest-smoke
+        name: pytest smoke
+        entry: pytest tests/smoke/ -x -q --tb=short
+        language: system
+        pass_filenames: false
+        always_run: true
+
+  # General hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: [--maxkb=1024]

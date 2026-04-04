@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=72", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "omnis"
+version = "0.1.0"
+description = "Universal Knowledge Hub — GraphRAG-powered knowledge management"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = [".", "api", "agents", "ingestion", "databases", "cli", "evals"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "ANN",  # flake8-annotations (type hints)
+    "PLC",  # pylint conventions
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "ANN101",  # missing type annotation for self
+    "ANN102",  # missing type annotation for cls
+    "ANN401",  # dynamically typed expressions (Any) are disallowed
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["api", "agents", "ingestion", "databases", "cli", "evals"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+exclude = ["tests/", "docs/"]
+
+[[tool.mypy.overrides]]
+module = ["lightrag.*", "taskiq.*", "graphiti.*", "langfuse.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --tb=short --cov=api --cov=agents --cov=ingestion --cov-report=term-missing"
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "integration: requires running Docker stack and a test PDF (deselected by default)",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+]

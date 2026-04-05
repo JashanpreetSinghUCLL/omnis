@@ -9,7 +9,7 @@ description = "Universal Knowledge Hub — GraphRAG-powered knowledge management
 requires-python = ">=3.12"
 
 [project.scripts]
-khub = "cli.main:app"
+omnis = "cli.main:app"
 
 [tool.setuptools.packages.find]
 where = ["."]

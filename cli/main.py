@@ -1,21 +1,21 @@
-"""khub — Universal Knowledge Hub CLI.
+"""omnis — Universal Knowledge Hub CLI.
 
 Commands
 --------
-    khub ingest <file>          Ingest a PDF into the knowledge graph.
-    khub ask "<question>"       Ask a question and stream the answer.
-    khub graph explore          Browse entities in the knowledge graph.
-    khub eval run               Run the evaluation suite.
-    khub status                 Check all service dependencies.
+    omnis ingest <file>          Ingest a PDF into the knowledge graph.
+    omnis ask "<question>"       Ask a question and stream the answer.
+    omnis graph explore          Browse entities in the knowledge graph.
+    omnis eval run               Run the evaluation suite.
+    omnis status                 Check all service dependencies.
 
 Install
 -------
-    pip install -e .            # makes `khub` available on PATH
+    pip install -e .             # makes `omnis` available on PATH
 
 Shell completions
 -----------------
-    khub --install-completion   # auto-detects your shell (bash/zsh/fish)
-    khub --show-completion      # print the completion script
+    omnis --install-completion   # auto-detects your shell (bash/zsh/fish)
+    omnis --show-completion      # print the completion script
 """
 
 from __future__ import annotations
@@ -35,10 +35,12 @@ from rich.text import Text
 
 console = Console()
 
+_HEADER = "bold cyan"  # shared Rich style for command headings
+
 # ── Sub-apps ──────────────────────────────────────────────────────────────────
 
 app = typer.Typer(
-    name="khub",
+    name="omnis",
     help="Universal Knowledge Hub — GraphRAG-powered knowledge management.",
     add_completion=True,
     rich_markup_mode="rich",
@@ -84,7 +86,7 @@ def _ingestion_config_from_settings(settings: Any) -> Any:
     )
 
 
-# ── khub ingest ───────────────────────────────────────────────────────────────
+# ── omnis ingest ──────────────────────────────────────────────────────────────
 
 _STAGES = ["parse", "chunk", "embed", "graph", "vector"]
 _STAGE_LABELS = {
@@ -113,7 +115,7 @@ def _build_ingest_table(
     elapsed: float,
 ) -> Table:
     """Render the ingestion progress table for Rich Live."""
-    table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+    table = Table(show_header=True, header_style=_HEADER, box=None, padding=(0, 1))
     table.add_column("Stage", min_width=18)
     table.add_column("Status", min_width=10)
     table.add_column("Time", min_width=8, justify="right")
@@ -131,26 +133,89 @@ def _build_ingest_table(
     bar_filled = "━" * (overall_pct // 5)
     bar_empty = "─" * (20 - overall_pct // 5)
     bar = f"[green]{bar_filled}[/green][dim]{bar_empty}[/dim]"
-
     mb = bytes_processed / (1024 * 1024)
     footer = (
         f"\n  Overall {bar} {overall_pct:3d}%  "
-        f"[dim]elapsed: {elapsed:.1f}s   "
-        f"bytes: {mb:.1f} MB   "
-        f"entities: {entities_found}[/dim]"
+        f"[dim]elapsed: {elapsed:.1f}s   bytes: {mb:.1f} MB   entities: {entities_found}[/dim]"
     )
 
     panel = Panel(
         table,
-        title="[bold]khub ingest[/bold]",
+        title="[bold]omnis ingest[/bold]",
         subtitle=Text.from_markup(footer),
         border_style="cyan",
         padding=(1, 2),
     )
-    # Wrap in a simple table so Live can render the Panel
     wrapper = Table.grid()
     wrapper.add_row(panel)
     return wrapper
+
+
+def _stage_detail(stage: str, data: dict[str, Any]) -> str:
+    """Return a human-readable detail string for a completed stage."""
+    if stage == "parse":
+        return f"{data.get('pages', '?')} pages, hash={data.get('hash', '?')}"
+    if stage == "chunk":
+        return f"{data.get('count', '?')} chunks"
+    if stage == "embed":
+        return f"{data.get('count', '?')} vectors"
+    if stage == "graph":
+        return f"{data.get('entities', 0)} entities, {data.get('relations', 0)} relations"
+    if stage == "vector":
+        return f"{data.get('count', '?')} points written"
+    return ""
+
+
+def _on_stage_done(
+    stage: str,
+    data: dict[str, Any],
+    stage_statuses: dict[str, str],
+    stage_times: dict[str, float],
+    stage_details: dict[str, str],
+    stage_start: dict[str, float],
+    entities_ref: list[int],
+) -> None:
+    """Handle a 'done' event for one pipeline stage."""
+    stage_statuses[stage] = "done"
+    elapsed_s = data.get("elapsed_s") or (
+        time.perf_counter() - stage_start.get(stage, time.perf_counter())
+    )
+    stage_times[stage] = elapsed_s
+    stage_details[stage] = _stage_detail(stage, data)
+    if stage == "graph":
+        entities_ref[0] = data.get("entities", 0)
+
+
+def _make_progress_cb(
+    stage_statuses: dict[str, str],
+    stage_times: dict[str, float],
+    stage_details: dict[str, str],
+    stage_start: dict[str, float],
+    entities_ref: list[int],
+) -> Any:
+    """Return a progress_cb closure that updates the shared state dicts."""
+
+    def progress_cb(stage: str, event: str, data: dict[str, Any]) -> None:
+        if stage == "*" and event == "skip":
+            for s in _STAGES:
+                stage_statuses[s] = "skip"
+            return
+        if stage not in _STAGES:
+            return
+        if event == "start":
+            stage_statuses[stage] = "running"
+            stage_start[stage] = time.perf_counter()
+            stage_details[stage] = "running…"
+        elif event == "done":
+            _on_stage_done(stage, data, stage_statuses, stage_times, stage_details, stage_start, entities_ref)
+        elif event == "skip":
+            stage_statuses[stage] = "skip"
+            stage_details[stage] = "already done"
+        elif event == "error":
+            stage_statuses[stage] = "error"
+            stage_details[stage] = str(data.get("error", "failed"))
+
+    return progress_cb
 
 
 @app.command()
@@ -170,92 +235,46 @@ def ingest(
     cfg.collection_name = collection
 
     file_bytes = file.stat().st_size
-
-    # ── Live progress state
     stage_statuses: dict[str, str] = dict.fromkeys(_STAGES, "pending")
     stage_times: dict[str, float] = {}
     stage_details: dict[str, str] = {}
     stage_start: dict[str, float] = {}
-    entities_found = 0
+    entities_ref: list[int] = [0]  # mutable container so closure can mutate it
 
-    def progress_cb(stage: str, event: str, data: dict[str, Any]) -> None:
-        nonlocal entities_found
-        if stage == "*" and event == "skip":
-            for s in _STAGES:
-                stage_statuses[s] = "skip"
-            return
-        if stage not in _STAGES:
-            return
-        if event == "start":
-            stage_statuses[stage] = "running"
-            stage_start[stage] = time.perf_counter()
-            stage_details[stage] = "running…"
-        elif event == "done":
-            stage_statuses[stage] = "done"
-            elapsed_s = data.get("elapsed_s") or (time.perf_counter() - stage_start.get(stage, time.perf_counter()))
-            stage_times[stage] = elapsed_s
-            if stage == "parse":
-                stage_details[stage] = f"{data.get('pages', '?')} pages, hash={data.get('hash', '?')}"
-            elif stage == "chunk":
-                stage_details[stage] = f"{data.get('count', '?')} chunks"
-            elif stage == "embed":
-                stage_details[stage] = f"{data.get('count', '?')} vectors"
-            elif stage == "graph":
-                e = data.get("entities", 0)
-                r = data.get("relations", 0)
-                entities_found = e
-                stage_details[stage] = f"{e} entities, {r} relations"
-            elif stage == "vector":
-                stage_details[stage] = f"{data.get('count', '?')} points written"
-        elif event == "skip":
-            stage_statuses[stage] = "skip"
-            stage_details[stage] = "already done"
-        elif event == "error":
-            stage_statuses[stage] = "error"
-            stage_details[stage] = str(data.get("error", "failed"))
+    progress_cb = _make_progress_cb(
+        stage_statuses, stage_times, stage_details, stage_start, entities_ref
+    )
+
+    def _current_table(elapsed: float, pct: int | None = None) -> Table:
+        done = sum(1 for s in stage_statuses.values() if s in ("done", "skip"))
+        return _build_ingest_table(
+            stage_statuses,
+            stage_times,
+            stage_details,
+            pct if pct is not None else int(done / len(_STAGES) * 100),
+            file_bytes,
+            entities_ref[0],
+            elapsed,
+        )
 
     t_start = time.perf_counter()
 
-    async def _run() -> Any:
+    async def _run_pipeline() -> Any:
         from ingestion.pipeline import run_ingestion
 
         return await run_ingestion(file, cfg, progress_cb=progress_cb)
 
+    async def _run_with_refresh(live: Live) -> Any:
+        task = asyncio.create_task(_run_pipeline())
+        while not task.done():
+            live.update(_current_table(time.perf_counter() - t_start))
+            await asyncio.sleep(0.1)
+        return await task
+
     with Live(console=console, refresh_per_second=8) as live:
+        result = asyncio.run(_run_with_refresh(live))
 
-        async def _run_with_refresh() -> Any:
-            task = asyncio.create_task(_run())
-            while not task.done():
-                done_count = sum(1 for s in stage_statuses.values() if s in ("done", "skip"))
-                pct = int(done_count / len(_STAGES) * 100)
-                live.update(
-                    _build_ingest_table(
-                        stage_statuses,
-                        stage_times,
-                        stage_details,
-                        pct,
-                        file_bytes,
-                        entities_found,
-                        time.perf_counter() - t_start,
-                    )
-                )
-                await asyncio.sleep(0.1)
-            return await task
-
-        result = asyncio.run(_run_with_refresh())
-
-    # Final render — 100%
-    console.print(
-        _build_ingest_table(
-            stage_statuses,
-            stage_times,
-            stage_details,
-            100,
-            file_bytes,
-            result.entities_extracted,
-            result.total_s,
-        )
-    )
+    console.print(_current_table(result.total_s, pct=100))
 
     if result.skipped:
         console.print("\n[cyan]↩  Already processed — skipped.[/cyan]")
@@ -263,7 +282,15 @@ def ingest(
         console.print(f"\n[green]✓  Done in {result.total_s:.1f}s[/green]  —  {result.source}")
 
 
-# ── khub ask ──────────────────────────────────────────────────────────────────
+# ── omnis ask ─────────────────────────────────────────────────────────────────
+
+_NODE_ICONS: dict[str, str] = {
+    "classifier": "🔀",
+    "researcher": "🔍",
+    "coder": "💻",
+    "reviewer": "🔎",
+    "degradation": "⚠️",
+}
 
 
 def _make_embed_fn_cli(voyage_key: str | None) -> Any:
@@ -291,6 +318,144 @@ def _make_embed_fn_cli(voyage_key: str | None) -> Any:
     return _bge
 
 
+def _reasoning_panel(lines: list[str]) -> Panel:
+    body = "\n".join(lines) if lines else "[dim]Starting…[/dim]"
+    return Panel(body, title="[bold]Agent Reasoning[/bold]", border_style="yellow", padding=(0, 1))
+
+
+def _node_reasoning_line(node_name: str, node_output: dict[str, Any], elapsed: float) -> str:
+    """Return a Rich-formatted reasoning line for one node output."""
+    icon = _NODE_ICONS.get(node_name, "•")
+    ts = f"([dim]{elapsed:.1f}s[/dim])"
+
+    if node_name == "classifier":
+        route = node_output.get("route", "?")
+        model = node_output.get("model_used", "?")
+        return f"  {icon} [bold]Classifier[/bold]  →  route=[cyan]{route}[/cyan]  model=[dim]{model}[/dim]  {ts}"
+
+    if node_name == "researcher":
+        chunks = len(node_output.get("context", []))
+        return f"  {icon} [bold]Researcher[/bold]  retrieved [cyan]{chunks}[/cyan] chunks  {ts}"
+
+    if node_name == "coder":
+        retry = node_output.get("retry_count", 0)
+        return f"  {icon} [bold]Coder[/bold]  retry=[cyan]{retry}[/cyan]  {ts}"
+
+    if node_name == "reviewer":
+        score = node_output.get("faithfulness_score")
+        score_str = f"{score:.2f}" if score is not None else "?"
+        color = "green" if (score or 0) >= 0.85 else "red"
+        return f"  {icon} [bold]Reviewer[/bold]  faithfulness=[{color}]{score_str}[/{color}]  {ts}"
+
+    if node_name == "degradation":
+        return f"  {icon} [bold red]Degradation[/bold red]  max retries reached  {ts}"
+
+    return f"  {icon} [bold]{node_name}[/bold]  {ts}"
+
+
+def _print_citations(citations: list[dict[str, Any]]) -> None:
+    """Print citation table to console."""
+    if not citations:
+        return
+    console.print()
+    cit_table = Table(title="Citations", show_header=True, header_style="bold", box=None)
+    cit_table.add_column("#", style="dim", width=4)
+    cit_table.add_column("Source")
+    cit_table.add_column("Score", justify="right")
+    for cit in citations:
+        score = cit.get("score")
+        cit_table.add_row(
+            str(cit.get("index", "")),
+            str(cit.get("source", "")),
+            f"{score:.3f}" if score is not None else "—",
+        )
+    console.print(cit_table)
+
+
+async def _stream_answer(answer: str) -> None:
+    """Print answer word-by-word to simulate streaming."""
+    words = answer.split()
+    chunk_size = 5
+    for i in range(0, len(words), chunk_size):
+        text_chunk = " ".join(words[i : i + chunk_size])
+        if i + chunk_size < len(words):
+            text_chunk += " "
+        console.print(text_chunk, end="")
+        await asyncio.sleep(0.015)
+    console.print()
+
+
+async def _run_ask(question: str, tenant: str, session: str, no_reasoning: bool, settings: Any) -> None:
+    """Core async logic for `omnis ask`."""
+    from agents.graph import build_graph
+    from agents.state import AgentState
+
+    voyage_key = settings.voyage_api_key.get_secret_value() if settings.voyage_api_key else None
+    embed_fn = _make_embed_fn_cli(voyage_key)
+
+    graph = build_graph(
+        anthropic_api_key=settings.anthropic_api_key_str,
+        qdrant_url=str(settings.qdrant_url),
+        qdrant_api_key=settings.qdrant_api_key.get_secret_value() if settings.qdrant_api_key else None,
+        neo4j_uri=settings.neo4j_uri,
+        neo4j_user=settings.neo4j_user,
+        neo4j_password=settings.neo4j_password_str,
+        cohere_api_key=settings.cohere_api_key_str,
+        embed_fn=embed_fn,
+    )
+
+    initial_state: AgentState = {  # type: ignore[assignment]
+        "question": question,
+        "session_id": session,
+        "tenant_id": tenant,
+        "route": None,
+        "model_used": "",
+        "context": [],
+        "citations": [],
+        "memory_facts": [],
+        "code_snippet": None,
+        "final_answer": None,
+        "errors": [],
+        "faithfulness_score": None,
+        "retry_count": 0,
+    }
+
+    reasoning_lines: list[str] = []
+    final_state: dict[str, Any] = {}
+    t0 = time.perf_counter()
+
+    with Live(console=console, refresh_per_second=10) as live:
+        if not no_reasoning:
+            live.update(_reasoning_panel(reasoning_lines))
+
+        async for chunk in graph.astream(initial_state):  # type: ignore[union-attr]
+            for node_name, node_output in chunk.items():
+                reasoning_lines.append(
+                    _node_reasoning_line(node_name, node_output, time.perf_counter() - t0)
+                )
+                final_state.update(node_output)
+                if not no_reasoning:
+                    live.update(_reasoning_panel(reasoning_lines))
+
+    if not no_reasoning:
+        console.print(_reasoning_panel(reasoning_lines))
+
+    answer: str = final_state.get("final_answer") or "No answer generated."
+    latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    console.print()
+    console.rule(f"[{_HEADER}]Answer[/{_HEADER}]")
+    console.print()
+    await _stream_answer(answer)
+
+    _print_citations(final_state.get("citations", []))
+
+    model = final_state.get("model_used", "unknown")
+    faithfulness = final_state.get("faithfulness_score")
+    faith_str = f"{faithfulness:.2f}" if faithfulness is not None else "—"
+    console.print(f"\n[dim]model={model}  faithfulness={faith_str}  latency={latency_ms:.0f}ms[/dim]")
+
+
 @app.command()
 def ask(
     question: Annotated[str, typer.Argument(help="Question to ask the knowledge hub.")],
@@ -304,154 +469,10 @@ def ask(
     streams answer tokens, and appends a citation table on completion.
     """
     settings = _load_settings()
-
-    async def _run() -> None:
-        from agents.graph import build_graph
-        from agents.state import AgentState
-
-        voyage_key = settings.voyage_api_key.get_secret_value() if settings.voyage_api_key else None
-        embed_fn = _make_embed_fn_cli(voyage_key)
-
-        graph = build_graph(
-            anthropic_api_key=settings.anthropic_api_key_str,
-            qdrant_url=str(settings.qdrant_url),
-            qdrant_api_key=settings.qdrant_api_key.get_secret_value() if settings.qdrant_api_key else None,
-            neo4j_uri=settings.neo4j_uri,
-            neo4j_user=settings.neo4j_user,
-            neo4j_password=settings.neo4j_password_str,
-            cohere_api_key=settings.cohere_api_key_str,
-            embed_fn=embed_fn,
-        )
-
-        initial_state: AgentState = {  # type: ignore[assignment]
-            "question": question,
-            "session_id": session,
-            "tenant_id": tenant,
-            "route": None,
-            "model_used": "",
-            "context": [],
-            "citations": [],
-            "memory_facts": [],
-            "code_snippet": None,
-            "final_answer": None,
-            "errors": [],
-            "faithfulness_score": None,
-            "retry_count": 0,
-        }
-
-        # ── Reasoning panel (live updated)
-        reasoning_lines: list[str] = []
-        final_state: dict[str, Any] = {}
-
-        _NODE_ICONS = {
-            "classifier": "🔀",
-            "researcher": "🔍",
-            "coder": "💻",
-            "reviewer": "🔎",
-            "degradation": "⚠️",
-        }
-
-        def _reasoning_panel() -> Panel:
-            body = "\n".join(reasoning_lines) if reasoning_lines else "[dim]Starting…[/dim]"
-            return Panel(body, title="[bold]Agent Reasoning[/bold]", border_style="yellow", padding=(0, 1))
-
-        t0 = time.perf_counter()
-
-        with Live(console=console, refresh_per_second=10) as live:
-            if not no_reasoning:
-                live.update(_reasoning_panel())
-
-            async for chunk in graph.astream(initial_state):  # type: ignore[union-attr]
-                for node_name, node_output in chunk.items():
-                    icon = _NODE_ICONS.get(node_name, "•")
-                    elapsed = time.perf_counter() - t0
-
-                    if node_name == "classifier":
-                        route = node_output.get("route", "?")
-                        model = node_output.get("model_used", "?")
-                        reasoning_lines.append(
-                            f"  {icon} [bold]Classifier[/bold]  →  route=[cyan]{route}[/cyan]  model=[dim]{model}[/dim]  ([dim]{elapsed:.1f}s[/dim])"
-                        )
-                    elif node_name == "researcher":
-                        chunks = len(node_output.get("context", []))
-                        reasoning_lines.append(
-                            f"  {icon} [bold]Researcher[/bold]  retrieved [cyan]{chunks}[/cyan] chunks  ([dim]{elapsed:.1f}s[/dim])"
-                        )
-                    elif node_name == "coder":
-                        retry = node_output.get("retry_count", 0)
-                        reasoning_lines.append(
-                            f"  {icon} [bold]Coder[/bold]  retry=[cyan]{retry}[/cyan]  ([dim]{elapsed:.1f}s[/dim])"
-                        )
-                    elif node_name == "reviewer":
-                        score = node_output.get("faithfulness_score")
-                        score_str = f"{score:.2f}" if score is not None else "?"
-                        passed = (score or 0) >= 0.85
-                        color = "green" if passed else "red"
-                        reasoning_lines.append(
-                            f"  {icon} [bold]Reviewer[/bold]  faithfulness=[{color}]{score_str}[/{color}]  ([dim]{elapsed:.1f}s[/dim])"
-                        )
-                    elif node_name == "degradation":
-                        reasoning_lines.append(
-                            f"  {icon} [bold red]Degradation[/bold red]  max retries reached  ([dim]{elapsed:.1f}s[/dim])"
-                        )
-
-                    final_state.update(node_output)
-
-                    if not no_reasoning:
-                        live.update(_reasoning_panel())
-
-        # ── Print reasoning panel (static after graph finishes)
-        if not no_reasoning:
-            console.print(_reasoning_panel())
-
-        # ── Stream answer
-        answer: str = final_state.get("final_answer") or "No answer generated."
-        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
-
-        console.print()
-        console.rule("[bold cyan]Answer[/bold cyan]")
-        console.print()
-
-        words = answer.split()
-        chunk_size = 5
-        for i in range(0, len(words), chunk_size):
-            text_chunk = " ".join(words[i : i + chunk_size])
-            if i + chunk_size < len(words):
-                text_chunk += " "
-            console.print(text_chunk, end="")
-            await asyncio.sleep(0.015)
-        console.print()
-
-        # ── Citations table
-        citations: list[dict[str, Any]] = final_state.get("citations", [])
-        if citations:
-            console.print()
-            cit_table = Table(title="Citations", show_header=True, header_style="bold", box=None)
-            cit_table.add_column("#", style="dim", width=4)
-            cit_table.add_column("Source")
-            cit_table.add_column("Score", justify="right")
-            for cit in citations:
-                score = cit.get("score")
-                score_str = f"{score:.3f}" if score is not None else "—"
-                cit_table.add_row(
-                    str(cit.get("index", "")),
-                    str(cit.get("source", "")),
-                    score_str,
-                )
-            console.print(cit_table)
-
-        # ── Footer
-        model = final_state.get("model_used", "unknown")
-        faithfulness = final_state.get("faithfulness_score")
-        faith_str = f"{faithfulness:.2f}" if faithfulness is not None else "—"
-        console.print(
-            f"\n[dim]model={model}  faithfulness={faith_str}  latency={latency_ms:.0f}ms[/dim]"
-        )
-
-    asyncio.run(_run())
+    asyncio.run(_run_ask(question, tenant, session, no_reasoning, settings))
 
 
-# ── khub graph explore ────────────────────────────────────────────────────────
+# ── omnis graph explore ───────────────────────────────────────────────────────
 
 
 @graph_app.command("explore")
@@ -499,7 +520,7 @@ def graph_explore(
         table = Table(
             title=f"Knowledge Graph — top {len(rows)} entities",
             show_header=True,
-            header_style="bold cyan",
+            header_style=_HEADER,
         )
         table.add_column("Type", style="cyan", min_width=14)
         table.add_column("Name", min_width=30)
@@ -517,7 +538,7 @@ def graph_explore(
     asyncio.run(_run())
 
 
-# ── khub eval run ─────────────────────────────────────────────────────────────
+# ── omnis eval run ────────────────────────────────────────────────────────────
 
 
 @eval_app.command("run")
@@ -536,7 +557,7 @@ def eval_run(
         f"[bold]Dataset:[/bold] {dataset}\n"
         f"[bold]Threshold:[/bold] {threshold}\n"
         f"[bold]Langfuse:[/bold] {settings.langfuse_host}",
-        title="[bold cyan]khub eval run[/bold cyan]",
+        title=f"[{_HEADER}]omnis eval run[/{_HEADER}]",
         border_style="cyan",
     ))
 
@@ -555,26 +576,24 @@ def eval_run(
     results_table.add_column("Threshold", justify="right")
     results_table.add_column("Pass")
 
-    # Placeholder results — replace with actual deepeval test case execution
     placeholder_metrics = [
         ("Faithfulness", 0.91, threshold),
         ("Answer Relevancy", 0.88, 0.80),
         ("Context Recall", 0.85, 0.75),
     ]
     for name, score, thr in placeholder_metrics:
-        passed = score >= thr
         results_table.add_row(
             name,
             f"{score:.2f}",
             f"{thr:.2f}",
-            "[green]✓[/green]" if passed else "[red]✗[/red]",
+            "[green]✓[/green]" if score >= thr else "[red]✗[/red]",
         )
 
     console.print(results_table)
     console.print("\n[dim]Traces exported to Langfuse for drill-down analysis.[/dim]")
 
 
-# ── khub status ───────────────────────────────────────────────────────────────
+# ── omnis status ──────────────────────────────────────────────────────────────
 
 
 async def _check_service(name: str, check_fn: Any) -> tuple[str, bool, str]:
@@ -633,7 +652,9 @@ def status() -> None:
     async def _run() -> None:
         checks = [
             ("Qdrant", lambda: _check_qdrant(str(settings.qdrant_url))),
-            ("Neo4j", lambda: _check_neo4j(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password_str)),
+            ("Neo4j", lambda: _check_neo4j(
+                settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password_str
+            )),
             ("Redis", lambda: _check_redis(settings.redis_url)),
             ("Langfuse", lambda: _check_langfuse(str(settings.langfuse_host))),
         ]
@@ -641,21 +662,23 @@ def status() -> None:
         with console.status("[cyan]Checking services…[/cyan]"):
             results = await asyncio.gather(*[_check_service(n, fn) for n, fn in checks])
 
-        table = Table(title="Service Status", show_header=True, header_style="bold cyan", box=None)
+        table = Table(title="Service Status", show_header=True, header_style=_HEADER, box=None)
         table.add_column("Service", min_width=14)
         table.add_column("Status", min_width=8)
         table.add_column("Detail")
 
         all_ok = True
         for name, ok, detail in results:
-            icon = "[green]✓ Up[/green]" if ok else "[red]✗ Down[/red]"
-            table.add_row(name, icon, f"[dim]{detail}[/dim]")
+            table.add_row(
+                name,
+                "[green]✓ Up[/green]" if ok else "[red]✗ Down[/red]",
+                f"[dim]{detail}[/dim]",
+            )
             if not ok:
                 all_ok = False
 
         console.print(table)
 
-        # Show Helicone/Langfuse config summary
         from observability.helicone import helicone_enabled
 
         console.print()
@@ -666,7 +689,10 @@ def status() -> None:
         console.print(Columns(config_items, equal=True, expand=False))
 
         if not all_ok:
-            console.print("\n[yellow]Some services are unreachable. Run [dim]docker compose up -d[/dim] to start them.[/yellow]")
+            console.print(
+                "\n[yellow]Some services are unreachable. "
+                "Run [dim]docker compose up -d[/dim] to start them.[/yellow]"
+            )
             raise typer.Exit(code=1)
 
     asyncio.run(_run())

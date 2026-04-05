@@ -12,7 +12,7 @@ services:
     environment:
       QDRANT__LOG_LEVEL: INFO
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/6333"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -94,12 +94,23 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - langfuse_clickhouse_data:/var/lib/clickhouse
+      - ./docker/clickhouse/config.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
     healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      test:
+        [
+          "CMD",
+          "clickhouse-client",
+          "--user",
+          "langfuse",
+          "--password",
+          "${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse_dev_pass}",
+          "--query",
+          "SELECT 1",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      start_period: 30s
 
   langfuse:
     image: langfuse/langfuse:3
@@ -115,6 +126,7 @@ services:
     environment:
       DATABASE_URL: postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD:-langfuse_dev_pass}@langfuse-postgres:5432/langfuse
       CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse:${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse_dev_pass}@langfuse-clickhouse:9000/langfuse
       CLICKHOUSE_USER: langfuse
       CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse_dev_pass}
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-super_secret_langfuse_dev}
@@ -129,8 +141,21 @@ services:
       LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_ADMIN_EMAIL:-admin@omnis.local}
       LANGFUSE_INIT_USER_NAME: admin
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_ADMIN_PASSWORD:-admin_dev_pass}
+      # Langfuse 3.x validates S3 bucket env vars at startup even when disabled.
+      # Provide dummy values so Zod passes; uploads are disabled so they are never used.
+      LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "local-dev-unused"
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: "us-east-1"
+      LANGFUSE_S3_MEDIA_UPLOAD_ENABLED: "false"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "local-dev-unused"
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: "us-east-1"
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/public/health"]
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'echo > /dev/tcp/127.0.0.1/3000 && echo OK' || exit 1",
+        ]
       interval: 15s
       timeout: 10s
       retries: 8

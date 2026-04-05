@@ -33,6 +33,7 @@ graphiti-core>=0.3.0
 taskiq>=0.11.0
 taskiq-redis>=0.5.0
 taskiq-fastapi>=0.3.0
+anyio>=4.4.0             # async primitives used by Taskiq internals
 
 # ── Config & Env ─────────────────────────────────────────────────────────────
 pydantic>=2.11.0
@@ -61,8 +62,9 @@ llama-parse>=0.5.0          # LlamaParse cloud (primary)
 pymupdf>=1.24.0             # PyMuPDF local fallback
 
 # ── Ingestion — Embeddings ────────────────────────────────────────────────────
-cohere>=5.0.0               # Cohere embed-v4.0 (primary)
+cohere>=5.0.0               # Cohere embed-v4.0 (primary) + Rerank v3.5
 fastembed>=0.4.0            # BAAI/bge-m3 local fallback
+sentence-transformers>=3.0.0  # BAAI/bge-reranker-base local rerank fallback
 
 # ── Ingestion — Entity resolution ─────────────────────────────────────────────
 spacy>=3.7.0                # SpaCySemanticMatchResolver

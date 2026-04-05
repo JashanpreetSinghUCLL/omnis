@@ -82,6 +82,27 @@ class Settings(BaseSettings):
         default="redis://:omnis_dev_redis@localhost:6379/1"
     )
 
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    rate_limit_free_tokens_per_day: int = Field(
+        default=10_000,
+        description="Daily token budget for the 'free' API key tier",
+    )
+    rate_limit_pro_tokens_per_day: int = Field(
+        default=500_000,
+        description="Daily token budget for the 'pro' API key tier",
+    )
+
+    # ── Response cache ────────────────────────────────────────────────────────
+    cache_l1_ttl_s: int = Field(
+        default=3_600, description="L1 exact-match cache TTL in seconds (1 hour)"
+    )
+    cache_l2_ttl_s: int = Field(
+        default=86_400, description="L2 semantic cache TTL in seconds (24 hours)"
+    )
+    cache_l2_threshold: float = Field(
+        default=0.90, description="Cosine similarity floor for L2 semantic cache hits"
+    )
+
     # ── Derived helpers ──────────────────────────────────────────────────────
     @field_validator("app_secret_key", mode="before")
     @classmethod

@@ -1,0 +1,60 @@
+<!-- Single-node ClickHouse config with embedded Keeper + cluster definition.
+     Langfuse 3.x issues DDL with `ON CLUSTER default` and uses ReplicatedMergeTree,
+     both of which require (a) a `default` cluster entry and (b) a Keeper/ZooKeeper
+     coordinator.  This file satisfies both for a single-node local setup. -->
+<clickhouse>
+    <logger>
+        <level>warning</level>
+        <console>true</console>
+    </logger>
+
+    <!-- ── Cluster definition required for `ON CLUSTER default` DDL ─────── -->
+    <remote_servers>
+        <default>
+            <shard>
+                <internal_replication>false</internal_replication>
+                <replica>
+                    <host>localhost</host>
+                    <port>9000</port>
+                    <!-- Pull credentials from the env vars set by docker-compose -->
+                    <user from_env="CLICKHOUSE_USER"/>
+                    <password from_env="CLICKHOUSE_PASSWORD"/>
+                </replica>
+            </shard>
+        </default>
+    </remote_servers>
+
+    <!-- ── Embedded ClickHouse Keeper (replaces external ZooKeeper) ──────── -->
+    <keeper_server>
+        <tcp_port>9181</tcp_port>
+        <server_id>1</server_id>
+        <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path>
+        <coordination_settings>
+            <operation_timeout_ms>10000</operation_timeout_ms>
+            <session_timeout_ms>30000</session_timeout_ms>
+            <raft_logs_level>warning</raft_logs_level>
+        </coordination_settings>
+        <raft_configuration>
+            <server>
+                <id>1</id>
+                <hostname>localhost</hostname>
+                <port>9444</port>
+            </server>
+        </raft_configuration>
+    </keeper_server>
+
+    <!-- Tell ClickHouse to use the embedded Keeper as its ZooKeeper endpoint -->
+    <zookeeper>
+        <node>
+            <host>localhost</host>
+            <port>9181</port>
+        </node>
+    </zookeeper>
+
+    <!-- Shard/replica macros used in ReplicatedMergeTree path templates -->
+    <macros>
+        <shard>01</shard>
+        <replica>01</replica>
+    </macros>
+</clickhouse>

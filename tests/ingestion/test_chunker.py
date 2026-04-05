@@ -9,9 +9,7 @@ Focus on:
 
 from __future__ import annotations
 
-import pytest
-
-from ingestion.chunker import Chunk, chunk_document
+from ingestion.chunker import chunk_document
 
 
 def _make_prose(n_words: int) -> str:

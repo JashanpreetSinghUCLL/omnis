@@ -32,6 +32,22 @@ ignore = [
     "ANN401",  # dynamically typed expressions (Any) are disallowed
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "PLC0415",  # local imports are intentional in tests (module reload / mock isolation)
+    "ANN",      # test functions do not require type annotations
+    "E501",     # long lines in test strings are acceptable
+    "I001",     # isort — test import order is less critical
+]
+# Lazy optional-dependency imports are intentional in these modules
+"agents/memory/__init__.py" = ["PLC0415"]
+"api/routes/query.py" = ["PLC0415"]
+"api/routes/ask.py" = ["PLC0415"]
+"api/routes/ingest.py" = ["PLC0415"]
+"api/main.py" = ["PLC0415"]
+"worker/tasks.py" = ["PLC0415"]
+"retrieval/graph_retriever.py" = ["PLC0415", "I001"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["api", "agents", "ingestion", "databases", "cli", "evals"]
 
@@ -49,10 +65,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-v --tb=short --cov=api --cov=agents --cov=ingestion --cov-report=term-missing"
+addopts = "-v --tb=short -m 'not integration' --cov=api --cov=agents --cov=ingestion --cov=retrieval --cov=worker --cov-report=term-missing"
 filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
     "integration: requires running Docker stack and a test PDF (deselected by default)",
+    "benchmark: end-to-end latency benchmark, requires live Qdrant + Neo4j",
 ]
 
 [tool.coverage.report]

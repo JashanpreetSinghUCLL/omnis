@@ -8,13 +8,12 @@ All external I/O (LlamaParse, PyMuPDF) is mocked.  Tests focus on:
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from ingestion.parser import ParsedDocument, _sha256_file, _validate, parse_pdf
+from ingestion.parser import _sha256_file, _validate, parse_pdf
 
 
 # ── Fixtures

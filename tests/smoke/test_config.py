@@ -35,7 +35,11 @@ def test_settings_loads_with_required_vars() -> None:
 
 
 def test_settings_crashes_on_missing_anthropic_key() -> None:
-    """Missing ANTHROPIC_API_KEY must raise ValidationError at startup."""
+    """Missing ANTHROPIC_API_KEY must raise ValidationError at startup.
+
+    Pass _env_file=None to prevent pydantic-settings from reading the project
+    .env file (which would otherwise supply the key and mask the missing-var error).
+    """
     from pydantic import ValidationError
 
     env = {k: v for k, v in REQUIRED_ENV_VARS.items() if k != "ANTHROPIC_API_KEY"}
@@ -43,19 +47,22 @@ def test_settings_crashes_on_missing_anthropic_key() -> None:
         with pytest.raises(ValidationError):
             from api.config import Settings
 
-            Settings()
+            Settings(_env_file=None)  # type: ignore[call-arg]
 
 
-def test_settings_crashes_on_missing_secret_key() -> None:
-    """Missing APP_SECRET_KEY must raise ValidationError at startup."""
-    from pydantic import ValidationError
+def test_settings_secret_key_has_dev_default() -> None:
+    """APP_SECRET_KEY has a default for dev; it does NOT crash when omitted.
 
+    The field is intentionally optional so docker compose up works without a
+    .env file.  Production enforcement happens via the model validator
+    (not a missing-field error).
+    """
     env = {k: v for k, v in REQUIRED_ENV_VARS.items() if k != "APP_SECRET_KEY"}
     with patch.dict(os.environ, env, clear=True):
-        with pytest.raises(ValidationError):
-            from api.config import Settings
+        from api.config import Settings
 
-            Settings()
+        s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert "dev-secret" in s.app_secret_key.get_secret_value()
 
 
 def test_is_production_flag() -> None:

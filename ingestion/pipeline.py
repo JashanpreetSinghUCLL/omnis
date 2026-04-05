@@ -14,6 +14,23 @@ Every stage is timed and the durations are logged at INFO level so you
 can spot bottlenecks (parsing is usually the slowest for large PDFs;
 graph extraction is the most expensive in API tokens).
 
+Progress callbacks
+------------------
+Pass an optional ``progress_cb`` to receive stage lifecycle events, which
+the CLI uses to drive a Rich live-panel display:
+
+    def my_cb(stage: str, event: str, data: dict) -> None:
+        # event: "start" | "done" | "skip" | "error"
+        print(stage, event, data)
+
+    result = await run_ingestion(path, cfg, progress_cb=my_cb)
+
+Langfuse tracing
+----------------
+When the Langfuse SDK is available, a top-level trace is created for the
+entire ingestion run and each stage becomes a child span.  Cost, latency,
+and entity counts are recorded automatically.
+
 Usage
 -----
     from ingestion.pipeline import run_ingestion, IngestionConfig
@@ -34,9 +51,9 @@ Usage
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +61,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _REDIS_TTL_S = 90 * 24 * 3600  # 90 days — processed-doc records
+
+# Stage callback: (stage_name, event, data) -> None
+# event ∈ {"start", "done", "skip", "error"}
+StageCallback = Callable[[str, str, dict[str, Any]], None]
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -173,7 +194,7 @@ class _Timer:
         self._start = 0.0
         self.elapsed = 0.0
 
-    def __enter__(self) -> "_Timer":
+    def __enter__(self) -> _Timer:
         self._start = time.perf_counter()
         return self
 
@@ -182,17 +203,73 @@ class _Timer:
         logger.info("Stage %-10s  %.2fs", self._label, self.elapsed)
 
 
+# ── Langfuse span helpers ─────────────────────────────────────────────────────
+
+
+def _lf_start_span(trace: Any, name: str, input_data: dict[str, Any]) -> Any:
+    """Create a Langfuse span if the trace object is not None."""
+    if trace is None:
+        return None
+    try:
+        return trace.span(name=name, input=input_data)
+    except Exception:
+        return None
+
+
+def _lf_end_span(span: Any, output: dict[str, Any]) -> None:
+    """End a Langfuse span with output data."""
+    if span is None:
+        return
+    try:
+        span.end(output=output)
+    except Exception:
+        pass
+
+
+def _lf_create_trace(source: str, tenant_id: str) -> Any:
+    """Create a Langfuse trace for an ingestion run; returns None on failure."""
+    try:
+        from observability.langfuse import get_langfuse_client
+
+        lf = get_langfuse_client()
+        return lf.trace(
+            name="ingestion",
+            input={"source": source, "tenant_id": tenant_id},
+            tags=["ingestion"],
+        )
+    except Exception:
+        return None
+
+
+def _lf_flush() -> None:
+    """Flush the Langfuse client (non-fatal)."""
+    try:
+        from observability.langfuse import get_langfuse_client
+
+        get_langfuse_client().flush()
+    except Exception:
+        pass
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 
 async def run_ingestion(
     pdf_path: str | Path,
     cfg: IngestionConfig,
+    progress_cb: StageCallback | None = None,
 ) -> IngestionResult:
     """Run the full ingestion pipeline for a single PDF.
 
     Returns an :class:`IngestionResult` regardless of whether the document
     was already processed (check `result.skipped`).
+
+    Args:
+        pdf_path: Path to the PDF file.
+        cfg: Ingestion configuration (database URLs, API keys, etc.).
+        progress_cb: Optional callback invoked at each stage lifecycle event.
+            Signature: ``(stage: str, event: str, data: dict) -> None``
+            where event ∈ ``{"start", "done", "skip", "error"}``.
     """
     from ingestion.chunker import chunk_document
     from ingestion.embedder import embed_chunks
@@ -203,25 +280,40 @@ async def run_ingestion(
     pdf_path = Path(pdf_path)
     source = pdf_path.name
 
+    def _cb(stage: str, event: str, data: dict[str, Any] | None = None) -> None:
+        if progress_cb is not None:
+            progress_cb(stage, event, data or {})
+
     # ── Connect to backing stores ─────────────────────────────────────────────
     redis = _make_redis(cfg.redis_url)
     qdrant = _make_qdrant(cfg.qdrant_url, cfg.qdrant_api_key)
     neo4j_driver = _make_neo4j(cfg.neo4j_uri, cfg.neo4j_user, cfg.neo4j_password)
 
-    # ── Stage 0: idempotency check (needs hash, so parse first minimally) ────
-    # We need the hash before we can check — parse does the hashing.
-    # For a pure hash-only check we'd need a pre-hash step; instead we
-    # parse first (fast local I/O), then check.
-
     result = IngestionResult(source=source, content_hash="")
+
+    # Start a Langfuse trace for the whole ingestion run
+    lf_trace = _lf_create_trace(source, cfg.tenant_id)
 
     try:
         # ── Stage 1: Parse ────────────────────────────────────────────────────
+        _cb("parse", "start", {"file": source, "bytes": pdf_path.stat().st_size})
+        lf_span = _lf_start_span(lf_trace, "parse", {"file": source})
         with _Timer("parse") as t_parse:
             doc = await parse_pdf(pdf_path, llama_cloud_api_key=cfg.llama_cloud_api_key)
         result.parse_s = t_parse.elapsed
         result.content_hash = doc.content_hash
         result.page_count = doc.page_count
+        _lf_end_span(lf_span, {"pages": doc.page_count, "parser": doc.parser_used})
+        _cb(
+            "parse",
+            "done",
+            {
+                "pages": doc.page_count,
+                "hash": doc.content_hash[:12],
+                "parser": doc.parser_used,
+                "elapsed_s": round(t_parse.elapsed, 2),
+            },
+        )
 
         logger.info(
             "Parsed %r — %d pages, hash=%s, parser=%s",
@@ -235,9 +327,12 @@ async def run_ingestion(
         if await _is_processed(redis, doc.content_hash):
             logger.info("Document %r already processed — skipping", source)
             result.skipped = True
+            _cb("*", "skip", {"hash": doc.content_hash[:12]})
             return result
 
         # ── Stage 2: Chunk (always cheap, always run) ─────────────────────────
+        _cb("chunk", "start", {})
+        lf_span = _lf_start_span(lf_trace, "chunk", {"chunk_size": cfg.chunk_size})
         with _Timer("chunk") as t_chunk:
             chunks = chunk_document(
                 doc.content,
@@ -247,25 +342,42 @@ async def run_ingestion(
             )
         result.chunk_s = t_chunk.elapsed
         result.chunk_count = len(chunks)
+        _lf_end_span(lf_span, {"chunk_count": len(chunks)})
+        _cb("chunk", "done", {"count": len(chunks), "elapsed_s": round(t_chunk.elapsed, 2)})
         logger.info("Chunked into %d chunks", len(chunks))
 
         # ── Stage 3: Embed ────────────────────────────────────────────────────
         if await _stage_done(redis, doc.content_hash, "embed"):
             logger.info("Stage embed   — already done, skipping")
+            _cb("embed", "skip", {})
             # Rebuild embedded list from cache (all hits, no API calls)
             embedded = await embed_chunks(chunks, redis=redis, voyage_api_key=None)
         else:
+            _cb("embed", "start", {"chunk_count": len(chunks)})
+            lf_span = _lf_start_span(lf_trace, "embed", {"chunks": len(chunks)})
             with _Timer("embed") as t_embed:
                 embedded = await embed_chunks(
                     chunks, redis=redis, voyage_api_key=cfg.voyage_api_key
                 )
             result.embed_s = t_embed.elapsed
+            _lf_end_span(
+                lf_span,
+                {"embedded_count": len(embedded), "elapsed_s": round(t_embed.elapsed, 2)},
+            )
+            _cb(
+                "embed",
+                "done",
+                {"count": len(embedded), "elapsed_s": round(t_embed.elapsed, 2)},
+            )
             await _mark_stage(redis, doc.content_hash, "embed")
 
         # ── Stage 4: Graph ────────────────────────────────────────────────────
         if await _stage_done(redis, doc.content_hash, "graph"):
             logger.info("Stage graph   — already done, skipping")
+            _cb("graph", "skip", {})
         else:
+            _cb("graph", "start", {"chunk_count": len(chunks)})
+            lf_span = _lf_start_span(lf_trace, "graph_extraction", {"chunks": len(chunks)})
             with _Timer("graph") as t_graph:
                 graph_stats = await build_graph(
                     chunks=chunks,
@@ -280,12 +392,34 @@ async def run_ingestion(
             result.entities_extracted = graph_stats.entities_before_cleanup
             result.relations_extracted = graph_stats.relation_count
             result.entities_resolved = graph_stats.entities_merged
+            _lf_end_span(
+                lf_span,
+                {
+                    "entities": graph_stats.entities_before_cleanup,
+                    "relations": graph_stats.relation_count,
+                    "merged": graph_stats.entities_merged,
+                    "elapsed_s": round(t_graph.elapsed, 2),
+                },
+            )
+            _cb(
+                "graph",
+                "done",
+                {
+                    "entities": result.entities_extracted,
+                    "relations": result.relations_extracted,
+                    "resolved": result.entities_resolved,
+                    "elapsed_s": round(t_graph.elapsed, 2),
+                },
+            )
             await _mark_stage(redis, doc.content_hash, "graph")
 
         # ── Stage 5: Vector store ─────────────────────────────────────────────
         if await _stage_done(redis, doc.content_hash, "vector"):
             logger.info("Stage vector  — already done, skipping")
+            _cb("vector", "skip", {})
         else:
+            _cb("vector", "start", {"embedded_count": len(embedded)})
+            lf_span = _lf_start_span(lf_trace, "vector_store", {"vectors": len(embedded)})
             with _Timer("vector") as t_vector:
                 result.vector_count = await push_to_qdrant(
                     embedded_chunks=embedded,
@@ -295,16 +429,44 @@ async def run_ingestion(
                     source=source,
                 )
             result.vector_s = t_vector.elapsed
+            _lf_end_span(
+                lf_span,
+                {
+                    "vectors_written": result.vector_count,
+                    "elapsed_s": round(t_vector.elapsed, 2),
+                },
+            )
+            _cb(
+                "vector",
+                "done",
+                {"count": result.vector_count, "elapsed_s": round(t_vector.elapsed, 2)},
+            )
             await _mark_stage(redis, doc.content_hash, "vector")
 
         # ── Mark fully complete ───────────────────────────────────────────────
         await _mark_processed(redis, doc.content_hash, source)
         logger.info("%s", result)
 
+        # Finalise the Langfuse trace with summary metrics
+        if lf_trace is not None:
+            try:
+                lf_trace.update(
+                    output={
+                        "pages": result.page_count,
+                        "chunks": result.chunk_count,
+                        "vectors": result.vector_count,
+                        "entities": result.entities_extracted,
+                        "total_s": round(result.total_s, 2),
+                    }
+                )
+            except Exception:
+                pass
+
     finally:
         # Always close connections
         await redis.aclose()
         await qdrant.close()
         await neo4j_driver.close()
+        _lf_flush()
 
     return result

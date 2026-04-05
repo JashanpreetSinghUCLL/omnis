@@ -176,6 +176,167 @@ async def _simulate_delta(answer: str, node: str = "researcher") -> AsyncIterato
         await asyncio.sleep(0.02)
 
 
+# ── _generate helpers (extracted to keep cognitive complexity within bounds) ──
+
+
+def _node_summary(node_name: str, node_output: dict) -> dict:  # type: ignore[type-arg]
+    """Return a compact SSE summary dict for a node's output."""
+    if node_name == "classifier":
+        return {"route": node_output.get("route"), "model_used": node_output.get("model_used")}
+    if node_name == "researcher":
+        return {
+            "chunk_count": len(node_output.get("context", [])),
+            "citation_count": len(node_output.get("citations", [])),
+        }
+    if node_name == "reviewer":
+        return {
+            "faithfulness_score": node_output.get("faithfulness_score"),
+            "retry_count": node_output.get("retry_count"),
+        }
+    if node_name == "coder":
+        return {"has_code": bool(node_output.get("code_snippet"))}
+    return {}
+
+
+async def _recall_prior_facts(memory: object, req: AskRequest) -> list[str]:
+    """Return Graphiti prior-turn facts; returns [] on any failure."""
+    try:
+        from agents.memory import GraphitiMemory  # already imported at module level
+
+        assert isinstance(memory, GraphitiMemory)
+        await memory.build_indices()
+        return await memory.recall_context(  # type: ignore[return-value]
+            tenant_id=req.tenant_id,
+            question=req.question,
+            num_results=5,
+        )
+    except Exception as exc:
+        logger.warning("Graphiti recall skipped: %s", exc)
+        return []
+
+
+async def _yield_cache_hit(
+    cache_result: tuple,  # type: ignore[type-arg]
+    t0: float,
+) -> AsyncIterator[str]:
+    """Yield SSE events for a cache hit (cache_hit → delta → citation → final)."""
+    layer, cached, similarity = cache_result
+    yield _sse({"type": "cache_hit", "layer": layer, "similarity": similarity})
+    async for delta in _simulate_delta(cached.get("answer", ""), "researcher"):
+        yield delta
+    for i, cit in enumerate(cached.get("citations", [])):
+        yield _sse(
+            CitationEvent(
+                index=cit.get("index", i + 1),
+                source=cit.get("source", ""),
+                chunk_id=cit.get("chunk_id"),
+                score=cit.get("score"),
+            )
+        )
+    yield _sse(
+        FinalEvent(
+            answer=cached.get("answer", ""),
+            model_used=cached.get("model_used", ""),
+            retry_count=cached.get("retry_count", 0),
+            faithfulness_score=cached.get("faithfulness_score"),
+            latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+        )
+    )
+
+
+async def _yield_graph_events(
+    graph: object,
+    initial_state: dict,  # type: ignore[type-arg]
+) -> AsyncIterator[tuple[str, dict]]:  # type: ignore[type-arg]
+    """Stream node outputs from the compiled LangGraph; yields (node_name, node_output)."""
+    async for chunk in graph.astream(initial_state):  # type: ignore[union-attr]
+        for node_name, node_output in chunk.items():
+            if node_name in _TRACKED_NODES:
+                yield node_name, node_output
+
+
+async def _store_result(
+    memory: object,
+    response_cache: object,
+    req: AskRequest,
+    answer: str,
+    citations: list[dict],  # type: ignore[type-arg]
+    final_state: dict,  # type: ignore[type-arg]
+    embed_fn: EmbedFn,
+) -> None:
+    """Persist turn in Graphiti memory and response in cache (both non-fatal)."""
+    try:
+        from agents.memory import GraphitiMemory
+
+        assert isinstance(memory, GraphitiMemory)
+        await memory.store_turn(
+            session_id=req.session_id,
+            tenant_id=req.tenant_id,
+            question=req.question,
+            answer=answer,
+            citations=citations,
+        )
+    except Exception as exc:
+        logger.warning("Graphiti store skipped: %s", exc)
+
+    cache_payload: dict = {  # type: ignore[type-arg]
+        "answer": answer,
+        "citations": citations,
+        "model_used": final_state.get("model_used") or "",
+        "retry_count": int(final_state.get("retry_count") or 0),
+        "faithfulness_score": final_state.get("faithfulness_score"),
+    }
+    try:
+        from api.middleware.cache import ResponseCache
+
+        assert isinstance(response_cache, ResponseCache)
+        embedding: list[float] | None = await response_cache._emb_get(req.question)
+        if embedding is None:
+            embedding = await embed_fn(req.question)
+        await response_cache.set(req.question, req.tenant_id, cache_payload, embedding)
+    except Exception as exc:
+        logger.warning("Cache store skipped: %s", exc)
+
+
+def _lf_start_query_trace(req: AskRequest) -> object:
+    """Create a Langfuse trace for one query; returns None if Langfuse unavailable."""
+    try:
+        from observability.langfuse import get_langfuse_client
+
+        lf = get_langfuse_client()
+        return lf.trace(
+            name="agent-query",
+            session_id=req.session_id,
+            user_id=req.tenant_id,
+            input={"question": req.question},
+            tags=["ask"],
+        )
+    except Exception:
+        return None
+
+
+def _lf_end_query_trace(trace: object, final_state: dict, latency_ms: float) -> None:  # type: ignore[type-arg]
+    """Update the Langfuse trace with final metrics."""
+    if trace is None:
+        return
+    try:
+        trace.update(  # type: ignore[union-attr]
+            output={"answer_preview": str(final_state.get("final_answer") or "")[:200]},
+            metadata={
+                "latency_ms": latency_ms,
+                "faithfulness_score": final_state.get("faithfulness_score"),
+                "model_used": final_state.get("model_used"),
+                "retry_count": final_state.get("retry_count"),
+                "citation_count": len(final_state.get("citations", [])),
+            },
+        )
+        from observability.langfuse import get_langfuse_client
+
+        get_langfuse_client().flush()
+    except Exception:
+        pass
+
+
 # ── Stream generator
 
 
@@ -186,58 +347,21 @@ async def _generate(
 ) -> AsyncIterator[str]:
     """Core async generator: checks cache → runs graph → yields SSE events."""
     t0 = time.perf_counter()
+    lf_trace = _lf_start_query_trace(req)
 
     # ── Cache lookup
     response_cache = _get_cache(id(settings), embed_fn)
     cache_result = await response_cache.get(req.question, req.tenant_id)
 
     if cache_result is not None:
-        layer, cached, similarity = cache_result
-        # Emit cache_hit event
-        yield _sse(
-            {
-                "type": "cache_hit",
-                "layer": layer,
-                "similarity": similarity,
-            }
-        )
-        # Replay cached answer as delta + final
-        async for delta in _simulate_delta(cached.get("answer", ""), "researcher"):
-            yield delta
-        for i, cit in enumerate(cached.get("citations", [])):
-            yield _sse(
-                CitationEvent(
-                    index=cit.get("index", i + 1),
-                    source=cit.get("source", ""),
-                    chunk_id=cit.get("chunk_id"),
-                    score=cit.get("score"),
-                )
-            )
-        yield _sse(
-            FinalEvent(
-                answer=cached.get("answer", ""),
-                model_used=cached.get("model_used", ""),
-                retry_count=cached.get("retry_count", 0),
-                faithfulness_score=cached.get("faithfulness_score"),
-                latency_ms=round((time.perf_counter() - t0) * 1000, 1),
-            )
-        )
+        async for event in _yield_cache_hit(cache_result, t0):
+            yield event
         return
 
-    # ── Cache miss — build graph and run
+    # ── Cache miss — run graph
     graph = _get_graph(id(settings), embed_fn)
     memory = _get_memory()
-
-    prior_facts: list[str] = []
-    try:
-        await memory.build_indices()
-        prior_facts = await memory.recall_context(
-            tenant_id=req.tenant_id,
-            question=req.question,
-            num_results=5,
-        )
-    except Exception as exc:
-        logger.warning("Graphiti recall skipped: %s", exc)
+    prior_facts = await _recall_prior_facts(memory, req)
 
     initial_state = {
         "question": req.question,
@@ -255,61 +379,31 @@ async def _generate(
         "retry_count": 0,
     }
 
-    # ── Stream graph execution (per-node state chunks)
-    final_state: dict = {}
+    final_state: dict = {}  # type: ignore[type-arg]
     try:
-        async for chunk in graph.astream(initial_state):  # type: ignore[union-attr]
-            # chunk = {node_name: partial_state_dict}
-            for node_name, node_output in chunk.items():
-                if node_name not in _TRACKED_NODES:
-                    continue
-
-                ts = time.time()
-                yield _sse(ToolStartEvent(node=node_name, ts=ts))
-
-                # Summarise node output for the tool_result payload
-                summary: dict = {}
-                if node_name == "classifier":
-                    summary = {
-                        "route": node_output.get("route"),
-                        "model_used": node_output.get("model_used"),
-                    }
-                elif node_name == "researcher":
-                    summary = {
-                        "chunk_count": len(node_output.get("context", [])),
-                        "citation_count": len(node_output.get("citations", [])),
-                    }
-                elif node_name == "reviewer":
-                    summary = {
-                        "faithfulness_score": node_output.get("faithfulness_score"),
-                        "retry_count": node_output.get("retry_count"),
-                    }
-                elif node_name == "coder":
-                    summary = {"has_code": bool(node_output.get("code_snippet"))}
-
-                yield _sse(
-                    ToolResultEvent(
-                        node=node_name,
-                        data=summary,
-                        ts=time.time(),
-                    )
+        async for node_name, node_output in _yield_graph_events(graph, initial_state):
+            ts = time.time()
+            yield _sse(ToolStartEvent(node=node_name, ts=ts))
+            yield _sse(
+                ToolResultEvent(
+                    node=node_name,
+                    data=_node_summary(node_name, node_output),
+                    ts=time.time(),
                 )
-
-                # Accumulate into final_state
-                final_state.update(node_output)
-
+            )
+            final_state.update(node_output)
     except Exception as exc:
         logger.exception("Graph streaming failed")
         yield _sse(ErrorEvent(detail=f"Graph execution failed: {exc}"))
         return
 
-    # ── Emit answer as delta stream
+    # ── Emit answer tokens
     answer: str = final_state.get("final_answer") or "No answer generated."
     async for delta in _simulate_delta(answer):
         yield delta
 
     # ── Emit citations
-    citations: list[dict] = final_state.get("citations", [])
+    citations: list[dict] = final_state.get("citations", [])  # type: ignore[type-arg]
     for i, cit in enumerate(citations):
         yield _sse(
             CitationEvent(
@@ -332,34 +426,9 @@ async def _generate(
         )
     )
 
-    # ── Store in memory + cache (non-fatal)
-    try:
-        await memory.store_turn(
-            session_id=req.session_id,
-            tenant_id=req.tenant_id,
-            question=req.question,
-            answer=answer,
-            citations=citations,
-        )
-    except Exception as exc:
-        logger.warning("Graphiti store skipped: %s", exc)
-
-    # Cache the response so future identical/similar queries are instant
-    cache_payload: dict = {
-        "answer": answer,
-        "citations": citations,
-        "model_used": final_state.get("model_used") or "",
-        "retry_count": int(final_state.get("retry_count") or 0),
-        "faithfulness_score": final_state.get("faithfulness_score"),
-    }
-    try:
-        # Try to get the embedding from L3 cache; if absent, compute it
-        embedding: list[float] | None = await response_cache._emb_get(req.question)
-        if embedding is None:
-            embedding = await embed_fn(req.question)
-        await response_cache.set(req.question, req.tenant_id, cache_payload, embedding)
-    except Exception as exc:
-        logger.warning("Cache store skipped: %s", exc)
+    # ── Persist + trace (non-fatal)
+    await _store_result(memory, response_cache, req, answer, citations, final_state, embed_fn)
+    _lf_end_query_trace(lf_trace, final_state, latency_ms)
 
 
 # ── Endpoint

@@ -8,10 +8,17 @@ version = "0.1.0"
 description = "Universal Knowledge Hub — GraphRAG-powered knowledge management"
 requires-python = ">=3.12"
 
+[project.scripts]
+khub = "cli.main:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["api*", "agents*", "ingestion*", "retrieval*", "cli*", "evals*", "databases*", "observability*", "worker*"]
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = [".", "api", "agents", "ingestion", "databases", "cli", "evals"]
+src = [".", "api", "agents", "ingestion", "databases", "cli", "evals", "observability"]
 
 [tool.ruff.lint]
 select = [
@@ -40,6 +47,10 @@ ignore = [
     "I001",     # isort — test import order is less critical
 ]
 # Lazy optional-dependency imports are intentional in these modules
+"cli/main.py" = ["PLC0415", "ANN", "E501"]
+"observability/langfuse.py" = ["PLC0415", "ANN"]
+"observability/helicone.py" = ["ANN"]
+"ingestion/pipeline.py" = ["PLC0415"]
 "agents/memory/__init__.py" = ["PLC0415"]
 "api/routes/query.py" = ["PLC0415"]
 "api/routes/ask.py" = ["PLC0415"]
@@ -49,7 +60,7 @@ ignore = [
 "retrieval/graph_retriever.py" = ["PLC0415", "I001"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["api", "agents", "ingestion", "databases", "cli", "evals"]
+known-first-party = ["api", "agents", "ingestion", "databases", "cli", "evals", "observability"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -59,7 +70,7 @@ plugins = ["pydantic.mypy"]
 exclude = ["tests/", "docs/"]
 
 [[tool.mypy.overrides]]
-module = ["lightrag.*", "taskiq.*", "graphiti.*", "langfuse.*"]
+module = ["lightrag.*", "taskiq.*", "graphiti.*", "langfuse.*", "voyageai.*", "fastembed.*", "deepeval.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

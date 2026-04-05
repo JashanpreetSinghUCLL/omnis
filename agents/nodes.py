@@ -14,6 +14,16 @@ Node execution order
 classifier → researcher → [coder] → reviewer
                               ↑___________|  (retry loop, max 3)
                           degradation (on retry ceiling)
+
+Observability
+-------------
+Every node closure is decorated with ``@observe(name=<node>)`` from the
+Langfuse decorators module.  If Langfuse is not installed the decorator falls
+back to a no-op so tests continue to work without the dependency.
+
+Each LLM call is routed through the Helicone proxy when ``HELICONE_API_KEY``
+is set in the environment.  This is transparent — just an extra base_url and
+header injected into ``ChatAnthropic``.
 """
 
 from __future__ import annotations
@@ -30,6 +40,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.router import HAIKU, SONNET, ModelRoute, route_question
 from agents.state import MAX_RETRIES, AgentState
+from observability.helicone import anthropic_client_kwargs
+from observability.langfuse import estimate_cost_usd, safe_observe, try_update_observation
 from retrieval.pipeline import HybridRetriever
 
 logger = logging.getLogger(__name__)
@@ -49,6 +61,9 @@ def _llm(model_id: str, api_key: str) -> ChatAnthropic:
     The routing uses logical model labels. This resolver allows mapping
     those labels to actually deployed Anthropic model IDs via env vars so the
     graph remains runnable across different accounts/regions.
+
+    When ``HELICONE_API_KEY`` is set, all calls are transparently proxied
+    through Helicone's gateway for cost tracking and latency metrics.
     """
     resolved_model_id = {
         "claude-haiku-3-5": os.getenv(
@@ -70,6 +85,7 @@ def _llm(model_id: str, api_key: str) -> ChatAnthropic:
         api_key=api_key,
         max_tokens=2048,
         temperature=0,
+        **anthropic_client_kwargs(),  # injects Helicone base_url + header when configured
     )
 
 
@@ -93,14 +109,28 @@ def _preview(text: str, limit: int = 240) -> str:
     return f"{compact[:limit]}..."
 
 
+def _extract_usage(response: Any) -> tuple[int, int]:
+    """Return (input_tokens, output_tokens) from a LangChain response."""
+    usage = getattr(response, "usage_metadata", None) or {}
+    return int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
+
+
 # ── Node 1: Classifier
 
 
 def make_classifier_node() -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
     """Return classifier_node — routes the question to 'researcher' or 'coder'."""
 
+    @safe_observe(name="classifier")
     async def classifier_node(state: AgentState) -> dict[str, Any]:
         decision: ModelRoute = route_question(state["question"])
+
+        try_update_observation(
+            input={"question": state["question"]},
+            output={"route": decision.route, "model_id": decision.model_id},
+            metadata={"tenant_id": state.get("tenant_id"), "session_id": state.get("session_id")},
+        )
+
         return {"route": decision.route, "model_used": decision.model_id}
 
     return classifier_node
@@ -123,10 +153,20 @@ def make_researcher_node(
 ) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
     """Return researcher_node — retrieves context and generates a grounded answer."""
 
+    @safe_observe(name="researcher")
     async def researcher_node(state: AgentState) -> dict[str, Any]:
         t0 = time.perf_counter()
         question = state["question"]
         memory_facts = state.get("memory_facts", [])
+
+        try_update_observation(
+            input={"question": question},
+            metadata={
+                "tenant_id": state.get("tenant_id"),
+                "session_id": state.get("session_id"),
+                "model": state.get("model_used"),
+            },
+        )
 
         # ── Embed query
         query_vector = await embed_fn(question)
@@ -177,12 +217,48 @@ def make_researcher_node(
             ]
         )
         answer = str(response.content)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+        # ── Capture token usage + cost in Langfuse span
+        in_tok, out_tok = _extract_usage(response)
+        _model_map = {
+            "claude-haiku-3-5": os.getenv(
+                "ROUTER_RUNTIME_HAIKU_MODEL", "claude-haiku-4-5-20251001"
+            ),
+            "claude-sonnet-4": os.getenv("ROUTER_RUNTIME_SONNET_MODEL", "claude-sonnet-4-6"),
+            "claude-opus-4": os.getenv("ROUTER_RUNTIME_OPUS_MODEL", "claude-opus-4-6"),
+        }
+        resolved_model = _model_map.get(model_id, model_id)
+        cost = estimate_cost_usd(resolved_model, in_tok, out_tok)
+
+        retrieval_scores = [
+            r.rerank_score for r in result.ranked if r.rerank_score is not None
+        ]
+        avg_retrieval_score = (
+            sum(retrieval_scores) / len(retrieval_scores) if retrieval_scores else 0.0
+        )
+
+        try_update_observation(
+            model=resolved_model,
+            usage={"input": in_tok, "output": out_tok},
+            output={"answer_preview": _preview(answer, 200), "chunk_count": len(context)},
+            metadata={
+                "latency_ms": latency_ms,
+                "cost_usd": round(cost, 6),
+                "avg_retrieval_score": round(avg_retrieval_score, 4),
+                "chunk_count": len(context),
+                "memory_facts": len(memory_facts),
+            },
+        )
 
         logger.info(
-            "Researcher | %.0fms chunks=%d memory_facts=%d answer_preview=%r",
-            (time.perf_counter() - t0) * 1000,
+            "Researcher | %.0fms chunks=%d memory=%d in=%d out=%d cost=$%.5f answer=%r",
+            latency_ms,
             len(context),
             len(memory_facts),
+            in_tok,
+            out_tok,
+            cost,
             _preview(answer),
         )
         return {"context": context, "citations": citations, "final_answer": answer}
@@ -217,12 +293,19 @@ def make_coder_node(
     a failed answer on reviewer retry (any route).
     """
 
+    @safe_observe(name="coder")
     async def coder_node(state: AgentState) -> dict[str, Any]:
+        t0 = time.perf_counter()
         route = state.get("route", "researcher")
         errors = state.get("errors", [])
         retry = state.get("retry_count", 0)
         ctx_text = _context_text(state["context"])
         question = state["question"]
+
+        try_update_observation(
+            input={"question": question, "route": route, "retry": retry, "errors": errors},
+            metadata={"tenant_id": state.get("tenant_id"), "session_id": state.get("session_id")},
+        )
 
         if route == "coder":
             system = _CODER_SYSTEM_CODE
@@ -252,12 +335,32 @@ def make_coder_node(
         )
         generated = str(response.content)
         new_retry = retry + 1
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+        in_tok, out_tok = _extract_usage(response)
+        resolved_sonnet = os.getenv("ROUTER_RUNTIME_SONNET_MODEL", "claude-sonnet-4-6")
+        cost = estimate_cost_usd(resolved_sonnet, in_tok, out_tok)
+
+        try_update_observation(
+            model=resolved_sonnet,
+            usage={"input": in_tok, "output": out_tok},
+            output={"output_preview": _preview(generated, 200)},
+            metadata={
+                "latency_ms": latency_ms,
+                "cost_usd": round(cost, 6),
+                "retry": new_retry,
+                "route": route,
+            },
+        )
 
         logger.info(
-            "Coder | retry=%d route=%s errors=%d question=%r output_preview=%r",
+            "Coder | retry=%d route=%s errors=%d in=%d out=%d cost=$%.5f q=%r out=%r",
             new_retry,
             route,
             len(errors),
+            in_tok,
+            out_tok,
+            cost,
             _preview(question, 120),
             _preview(generated),
         )
@@ -289,39 +392,65 @@ def _output_to_review(state: AgentState) -> str:
     return state.get("final_answer") or ""
 
 
+def _forced_fail_issue(retry: int) -> str | None:
+    """Return a forced-failure issue string when debug env vars are set, else None."""
+    if os.getenv("AGENT_REVIEWER_FORCE_FAIL_ALWAYS", "").strip() in {"1", "true", "TRUE"}:
+        return "forced reviewer failure for smoke test"
+    raw = os.getenv("AGENT_REVIEWER_FORCE_FAIL_UNTIL", "").strip()
+    fail_until = int(raw) if raw.isdigit() else 0
+    if retry < fail_until:
+        return f"forced reviewer failure until retry_count >= {fail_until}"
+    return None
+
+
+def _parse_reviewer_json(raw: str) -> tuple[float, list[str]]:
+    """Parse the LLM-as-judge JSON response; return (score, issues)."""
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
+    try:
+        parsed = json.loads(raw)
+        score = float(parsed.get("score", 0.5))
+        issues = [str(i) for i in parsed.get("issues", [])]
+        return score, issues
+    except (ValueError, KeyError) as exc:
+        logger.warning("Reviewer: failed to parse response — %s", exc)
+        return 0.5, [f"Could not parse reviewer response: {exc}"]
+
+
 def make_reviewer_node(
     api_key: str,
 ) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
     """Return reviewer_node — LLM-as-judge faithfulness check (threshold ≥ 0.85)."""
 
+    @safe_observe(name="reviewer")
     async def reviewer_node(state: AgentState) -> dict[str, Any]:
+        t0 = time.perf_counter()
         output = _output_to_review(state)
+        retry = int(state.get("retry_count") or 0)
+
         if not output.strip():
             logger.warning("Reviewer: no output to review")
+            try_update_observation(
+                output={"score": 0.0, "issues": ["No output to evaluate."]},
+                metadata={"error": "empty_output"},
+            )
             return {"faithfulness_score": 0.0, "errors": ["No output to evaluate."]}
 
         # Debug hooks for deterministic smoke testing.
-        fail_always = os.getenv("AGENT_REVIEWER_FORCE_FAIL_ALWAYS", "").strip() in {
-            "1",
-            "true",
-            "TRUE",
-        }
-        fail_until_raw = os.getenv("AGENT_REVIEWER_FORCE_FAIL_UNTIL", "").strip()
-        fail_until = int(fail_until_raw) if fail_until_raw.isdigit() else 0
-        retry = int(state.get("retry_count") or 0)
-        if fail_always or retry < fail_until:
-            issue = (
-                "forced reviewer failure for smoke test"
-                if fail_always
-                else f"forced reviewer failure until retry_count >= {fail_until}"
-            )
+        forced_issue = _forced_fail_issue(retry)
+        if forced_issue:
             logger.warning(
                 "Reviewer | forced_fail=1 retry=%d route=%s output_preview=%r",
                 retry,
                 state.get("route"),
                 _preview(output),
             )
-            return {"faithfulness_score": 0.0, "errors": [issue]}
+            try_update_observation(
+                output={"score": 0.0, "issues": [forced_issue]},
+                metadata={"forced_fail": True, "retry": retry},
+            )
+            return {"faithfulness_score": 0.0, "errors": [forced_issue]}
 
         ctx_text = _context_text(state["context"])
         llm = _llm(HAIKU, api_key)  # cheap model is sufficient for evaluation
@@ -334,29 +463,37 @@ def make_reviewer_node(
             ]
         )
 
-        # ── Parse JSON score
         raw = str(response.content).strip()
-        # Strip markdown code fences if the model wraps the JSON
-        if raw.startswith("```"):
-            inner = raw.split("```")
-            raw = inner[1].lstrip("json").strip() if len(inner) > 1 else raw
+        score, issues = _parse_reviewer_json(raw)
 
-        try:
-            parsed = json.loads(raw)
-            score = float(parsed.get("score", 0.5))
-            issues = [str(i) for i in parsed.get("issues", [])]
-        except (json.JSONDecodeError, ValueError, KeyError) as exc:
-            logger.warning("Reviewer: failed to parse response — %s", exc)
-            score = 0.5
-            issues = [f"Could not parse reviewer response: {exc}"]
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        in_tok, out_tok = _extract_usage(response)
+        resolved_haiku = os.getenv("ROUTER_RUNTIME_HAIKU_MODEL", "claude-haiku-4-5-20251001")
+        cost = estimate_cost_usd(resolved_haiku, in_tok, out_tok)
+
+        try_update_observation(
+            model=resolved_haiku,
+            usage={"input": in_tok, "output": out_tok},
+            output={"score": score, "issues": issues},
+            metadata={
+                "latency_ms": latency_ms,
+                "cost_usd": round(cost, 6),
+                "faithfulness_score": score,
+                "passed": score >= FAITHFULNESS_THRESHOLD,
+                "retry": retry,
+            },
+        )
 
         logger.info(
             "Reviewer | score=%.2f threshold=%.2f retry=%d issues=%d "
-            "output_preview=%r raw_preview=%r",
+            "in_tok=%d out_tok=%d cost=$%.5f output_preview=%r raw_preview=%r",
             score,
             FAITHFULNESS_THRESHOLD,
             retry,
             len(issues),
+            in_tok,
+            out_tok,
+            cost,
             _preview(output),
             _preview(raw),
         )
@@ -376,6 +513,7 @@ def make_reviewer_node(
 # ── Degradation node
 
 
+@safe_observe(name="degradation")
 async def degradation_node(state: AgentState) -> dict[str, Any]:
     """Terminal node: emit a graceful degradation message after MAX_RETRIES failures."""
     logger.warning(
@@ -388,5 +526,9 @@ async def degradation_node(state: AgentState) -> dict[str, Any]:
         f"{MAX_RETRIES} attempts. "
         "Please rephrase your question or consult the documentation directly. "
         f"Retrieved context: {len(state.get('context', []))} chunks available."
+    )
+    try_update_observation(
+        output={"message": msg},
+        metadata={"retries_exhausted": True, "max_retries": MAX_RETRIES},
     )
     return {"final_answer": msg}

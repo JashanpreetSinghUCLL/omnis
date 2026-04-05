@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     langfuse_public_key: str = Field(default="lf-pk-omnis-dev")
     langfuse_secret_key: SecretStr = Field(default="lf-sk-omnis-dev")
 
+    # ── Helicone ──────────────────────────────────────────────────────────────
+    helicone_api_key: SecretStr | None = Field(
+        default=None,
+        description="Helicone gateway API key. When set, all LLM calls are proxied through "
+        "Helicone for automatic cost tracking and latency metrics.",
+    )
+
     # ── Taskiq ───────────────────────────────────────────────────────────────
     taskiq_broker_url: str = Field(
         default="redis://:omnis_dev_redis@localhost:6379/1"

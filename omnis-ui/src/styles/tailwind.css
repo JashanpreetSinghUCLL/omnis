@@ -1,0 +1,8 @@
+@import "tailwindcss";
+@source "../**/*.{js,ts,jsx,tsx}";
+@import "tw-animate-css";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}

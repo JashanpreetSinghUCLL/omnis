@@ -56,9 +56,17 @@ def create_app() -> FastAPI:
     app.add_middleware(RateLimitMiddleware, redis_url=settings.redis_url)
 
     # ── CORS — must be added last so it runs outermost (first on every request)
+    # Dev: allow all origins.  Production: restrict to ALLOWED_ORIGINS env var
+    # (comma-separated list, e.g. "https://app.omnis.io,https://omnis.io").
+    # Falls back to deny-all if the var is not set in production — set it.
+    _allowed: list[str] = (
+        ["*"]
+        if not settings.is_production
+        else [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+    )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"] if not settings.is_production else [],
+        allow_origins=_allowed,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -66,7 +74,7 @@ def create_app() -> FastAPI:
 
     # ── Routes
     from api.routes import health, query  # noqa: PLC0415
-    from api.routes import ask, ingest  # noqa: PLC0415
+    from api.routes import ask, ingest, graph  # noqa: PLC0415
 
     # Legacy /api routes (Sprint 1–4)
     app.include_router(health.router)
@@ -75,6 +83,7 @@ def create_app() -> FastAPI:
     # Versioned /v1 routes (Sprint 5+)
     app.include_router(ask.router)
     app.include_router(ingest.router)
+    app.include_router(graph.router)
 
     return app
 

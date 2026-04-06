@@ -89,6 +89,12 @@ class Settings(BaseSettings):
         default="redis://:omnis_dev_redis@localhost:6379/1"
     )
 
+    # ── CORS ─────────────────────────────────────────────────────────────────
+    allowed_origins: str = Field(
+        default="http://localhost:5173",
+        description="Comma-separated list of allowed CORS origins (production only)",
+    )
+
     # ── Rate limiting ─────────────────────────────────────────────────────────
     rate_limit_free_tokens_per_day: int = Field(
         default=10_000,
@@ -113,7 +119,14 @@ class Settings(BaseSettings):
     # ── Derived helpers ──────────────────────────────────────────────────────
     @field_validator("app_secret_key", mode="before")
     @classmethod
-    def _reject_default_secret_in_prod(cls, v: str) -> str:
+    def _reject_default_secret_in_prod(cls, v: str, info: object) -> str:
+        import os
+
+        if os.getenv("APP_ENV") == "production" and v == "dev-secret-change-in-production-!!!":
+            raise ValueError(
+                "APP_SECRET_KEY must be set to a strong random value in production. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
         return v
 
     @property

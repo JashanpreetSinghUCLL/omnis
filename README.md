@@ -8,10 +8,11 @@
 
 ```bash
 cp .env.example .env          # 1. copy env template and fill in your API keys
-docker compose up -d          # 2. spin up Qdrant · Neo4j · Redis · Langfuse
-pip install -r requirements.txt && uvicorn api.main:app --reload  # 3. start API
+docker compose up --build -d  # 2. build + boot API · worker · UI · infra
+docker compose logs -f api worker  # 3. watch backend + worker logs
 ```
 
+**UI:** http://localhost:5173
 **API docs:** http://localhost:8000/docs
 **Langfuse observability:** http://localhost:3000
 **Qdrant dashboard:** http://localhost:6333/dashboard
@@ -48,6 +49,9 @@ omnis/
 
 | Service | Port | Notes |
 |---|---|---|
+| UI | 5173 | Frontend (Nginx serving Vite build) |
+| API | 8000 | FastAPI app |
+| Worker | internal | Taskiq ingestion worker |
 | Qdrant | 6333 (HTTP) · 6334 (gRPC) | Vector store |
 | Neo4j | 7474 (Browser) · 7687 (Bolt) | Graph store |
 | Redis | 6379 | Cache + task broker |

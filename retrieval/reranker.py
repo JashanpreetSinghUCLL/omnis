@@ -139,6 +139,17 @@ class Reranker:
             for i, c in enumerate(candidates[: self._top_n])
         ]
 
+    # ── Warmup (call once at startup to avoid cold-start on first query)
+
+    def warmup(self) -> None:
+        """Load the local CrossEncoder model eagerly (no-op if Cohere is configured)."""
+        if self._cohere_api_key or CrossEncoder is None:
+            return
+        if self._cross_encoder is None:
+            logger.info("Warming up local reranker: %s", _LOCAL_MODEL)
+            self._cross_encoder = CrossEncoder(_LOCAL_MODEL)
+            logger.info("Local reranker ready")
+
     # ── Async public API
 
     async def rerank(
@@ -180,21 +191,8 @@ class Reranker:
             except Exception as exc:
                 logger.warning("Cohere rerank failed (%s), trying local fallback", exc)
 
-        # 2. Try local CrossEncoder
-        try:
-            ranked, backend = await loop.run_in_executor(
-                None, self._local_rerank, query, candidates
-            )
-            ms = (time.perf_counter() - t0) * 1000
-            logger.info(
-                "Reranker[local] | %.1fms | %d -> %d",
-                ms,
-                len(candidates),
-                len(ranked),
-            )
-            return RerankerResult(ranked=ranked, latency_ms=ms, backend=backend)
-        except Exception as exc:
-            logger.error("Local reranker failed (%s), using RRF passthrough", exc)
+        # 2. Local CrossEncoder — skipped when no Cohere key (too slow on CPU/emulated x86)
+        # Passthrough (RRF ordering) is used instead.
 
         # 3. Passthrough fallback
         ranked = self._passthrough(candidates)

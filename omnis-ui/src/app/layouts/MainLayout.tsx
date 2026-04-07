@@ -1,10 +1,9 @@
 import { Outlet, Link, useLocation, useNavigate } from "react-router";
-import { MessageSquare, Network, FileText, BarChart3, Settings, Bell, User, Search, Command, Moon, Sun, ChevronLeft, ChevronRight, LogOut, ChevronDown } from "lucide-react";
+import { MessageSquare, Network, FileText, BarChart3, Settings, Bell, User, Search, Moon, Sun, ChevronLeft, ChevronRight, LogOut, ChevronDown } from "lucide-react";
 import { useTheme } from "../components/ThemeProvider";
 import { useState, useRef, useEffect } from "react";
+import { useUpload } from "../context/UploadContext";
 
-const isMac = typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
 
 export default function MainLayout() {
   const location = useLocation();
@@ -32,6 +31,11 @@ export default function MainLayout() {
     { path: "/evaluations", label: "Evaluations", icon: BarChart3 },
     { path: "/settings", label: "Settings", icon: Settings },
   ];
+
+  const { uploadState } = useUpload();
+  const isUploading = uploadState !== null &&
+    uploadState.phase !== "complete" &&
+    uploadState.phase !== "failed";
 
   const isActive = (path: string) => {
     if (path === "/") return location.pathname === "/";
@@ -83,12 +87,6 @@ export default function MainLayout() {
               className="flex-1 bg-transparent border-0 outline-none placeholder:text-text-tertiary"
               style={{ color: 'var(--text-primary)', fontSize: '13px' }}
             />
-            <kbd
-              className="px-2 py-0.5 rounded text-[10px] flex items-center gap-1"
-              style={{ background: 'var(--surface)', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', border: '1px solid var(--border)' }}
-            >
-              {isMac ? <><Command size={10} /> K</> : <>Ctrl K</>}
-            </kbd>
           </div>
         </div>
 
@@ -255,8 +253,42 @@ export default function MainLayout() {
                       style={{ background: 'var(--accent-teal)' }}
                     />
                   )}
-                  <Icon size={16} style={{ flexShrink: 0 }} />
-                  {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
+                  <div style={{ position: "relative", flexShrink: 0 }}>
+                    <Icon size={16} />
+                    {isUploading && item.path === "/documents" && (
+                      <span
+                        className="animate-pulse"
+                        style={{
+                          position: "absolute",
+                          top: -3,
+                          right: -3,
+                          width: 7,
+                          height: 7,
+                          borderRadius: "50%",
+                          background: "var(--accent-teal)",
+                          boxShadow: "0 0 4px var(--accent-teal)",
+                          display: "block",
+                        }}
+                      />
+                    )}
+                  </div>
+                  {!sidebarCollapsed && (
+                    <span className="truncate flex-1">{item.label}</span>
+                  )}
+                  {!sidebarCollapsed && isUploading && item.path === "/documents" && (
+                    <span
+                      className="text-[9px] px-1.5 py-0.5 rounded-full"
+                      style={{
+                        background: "rgba(0, 217, 192, 0.15)",
+                        color: "var(--accent-teal)",
+                        fontFamily: "var(--font-mono)",
+                        border: "1px solid rgba(0, 217, 192, 0.3)",
+                        flexShrink: 0,
+                      }}
+                    >
+                      {uploadState!.totalPct}%
+                    </span>
+                  )}
                 </Link>
               );
             })}

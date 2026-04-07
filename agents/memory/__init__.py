@@ -88,7 +88,7 @@ class GraphitiMemory:
                 source_description="omnis_agent",
                 reference_time=datetime.now(UTC),
                 episode_type=EpisodeType.text,
-                group_id=f"tenant:{tenant_id}",
+                group_id=f"tenant_{tenant_id}",
             )
             logger.debug("GraphitiMemory: stored turn session=%s", session_id)
         except Exception as exc:
@@ -105,7 +105,7 @@ class GraphitiMemory:
         try:
             results = await self._client.search(
                 query=question,
-                group_ids=[f"tenant:{tenant_id}"],
+                group_ids=[f"tenant_{tenant_id}"],
                 num_results=num_results,
             )
             return [str(getattr(r, "fact", r)) for r in results]

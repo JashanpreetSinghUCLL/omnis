@@ -38,6 +38,12 @@ class Settings(BaseSettings):
         default=None, description="Voyage AI embedding key (optional)"
     )
 
+    # ── Embeddings ───────────────────────────────────────────────────────────
+    local_embed_model: str = Field(
+        default="BAAI/bge-small-en-v1.5",
+        description="fastembed model used when Voyage key is absent",
+    )
+
     # ── Ingestion ─────────────────────────────────────────────────────────────
     cohere_api_key: SecretStr | None = Field(
         default=None, description="Cohere embed-v4 key; falls back to local BGE-M3"

@@ -43,6 +43,7 @@ async def publish_progress(
     status: str,  # "running" | "done" | "error"
     detail: str = "",
     progress: float = 0.0,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     payload = json.dumps(
         {
@@ -52,6 +53,7 @@ async def publish_progress(
             "detail": detail,
             "progress": round(progress, 3),
             "ts": time.time(),
+            **(extra or {}),
         }
     )
     try:
@@ -68,6 +70,7 @@ async def ingest_document_task(
     file_path: str,
     tenant_id: str,
     job_id: str,
+    original_filename: str = "",
     ctx: Context = TaskiqDepends(),
 ) -> dict[str, Any]:
     """Run the full ingestion pipeline for one document.
@@ -135,7 +138,7 @@ async def ingest_document_task(
         # We wrap each stage in a coroutine so we can publish progress
         # around the synchronous pipeline call.
         await publish_progress(redis_client, job_id, "parse", "running", progress=0.0)
-        result = await run_ingestion(file_path, cfg)
+        result = await run_ingestion(file_path, cfg, source_name=original_filename or None)
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
         # Publish per-stage timings after completion
@@ -156,7 +159,8 @@ async def ingest_document_task(
                 progress=(i + 1) / len(_STAGES),
             )
 
-        # Final completion event
+        # Final completion event — embed counts so the client doesn't need
+        # a separate REST call (avoids race with Taskiq storing the result).
         await publish_progress(
             redis_client,
             job_id,
@@ -168,6 +172,11 @@ async def ingest_document_task(
                 + (" [SKIPPED — already processed]" if result.skipped else "")
             ),
             progress=1.0,
+            extra={
+                "page_count": result.page_count,
+                "chunk_count": result.chunk_count,
+                "entities_extracted": result.entities_extracted,
+            },
         )
 
         logger.info(

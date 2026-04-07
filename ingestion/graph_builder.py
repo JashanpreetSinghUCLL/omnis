@@ -82,11 +82,12 @@ def _make_fastembed_embedder() -> Any:
     """Return a neo4j-graphrag Embedder backed by fastembed (already installed)."""
     from neo4j_graphrag.embeddings import Embedder  # type: ignore[import-untyped]
     from fastembed import TextEmbedding  # type: ignore[import-untyped]
+    from ingestion.embed_config import LOCAL_EMBED_MODEL
 
     class _FastEmbedEmbedder(Embedder):
         def __init__(self) -> None:
             super().__init__()
-            self._model = TextEmbedding("BAAI/bge-large-en-v1.5")
+            self._model = TextEmbedding(LOCAL_EMBED_MODEL)
 
         def embed_query(self, text: str) -> list[float]:
             return next(iter(self._model.embed([text]))).tolist()

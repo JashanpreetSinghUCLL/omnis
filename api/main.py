@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -12,6 +13,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _warm_models() -> None:
+    """Download and cache models used at query time.
+
+    Runs in a thread so it doesn't block the event loop.  Errors are logged
+    but never propagated — the API starts regardless.
+    """
+    # 1. Embedding model (bge-small-en-v1.5)
+    try:
+        from api.routes.ask import _make_embed_fn  # noqa: PLC0415
+
+        settings = get_settings()
+        voyage_key = (
+            settings.voyage_api_key.get_secret_value() if settings.voyage_api_key else None
+        )
+        _make_embed_fn(voyage_key)
+        logger.info("Embed model pre-warmed")
+    except Exception as exc:
+        logger.warning("Embed model pre-warm failed (non-fatal): %s", exc)
+
 
 
 @asynccontextmanager
@@ -27,6 +49,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await broker.startup()
     logger.info("Taskiq broker started")
+
+    # Pre-warm the embedding model in a background thread so the first /v1/ask
+    # request doesn't block downloading BAAI/bge-small-en-v1.5.
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _warm_models)
 
     yield
 

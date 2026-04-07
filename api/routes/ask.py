@@ -38,6 +38,7 @@ from agents.graph import build_graph
 from agents.memory import GraphitiMemory
 from agents.nodes import EmbedFn
 from api.config import Settings, get_settings
+from ingestion.embed_config import LOCAL_EMBED_MODEL
 from api.middleware.cache import ResponseCache
 from api.schemas.ask import (
     AskRequest,
@@ -81,7 +82,7 @@ def _make_embed_fn(voyage_key: str | None) -> EmbedFn:
 
         from fastembed import TextEmbedding  # type: ignore[import-untyped]
 
-        _model = TextEmbedding("BAAI/bge-large-en-v1.5")
+        _model = TextEmbedding(LOCAL_EMBED_MODEL)
 
         async def _bge(text: str) -> list[float]:
             loop = _asyncio.get_running_loop()
@@ -181,21 +182,25 @@ async def _simulate_delta(answer: str, node: str = "researcher") -> AsyncIterato
 
 def _node_summary(node_name: str, node_output: dict) -> dict:  # type: ignore[type-arg]
     """Return a compact SSE summary dict for a node's output."""
+    latency = node_output.get("latency_ms")
+    base: dict = {"latency_ms": latency} if latency is not None else {}  # type: ignore[type-arg]
     if node_name == "classifier":
-        return {"route": node_output.get("route"), "model_used": node_output.get("model_used")}
+        return {**base, "route": node_output.get("route"), "model_used": node_output.get("model_used")}
     if node_name == "researcher":
         return {
+            **base,
             "chunk_count": len(node_output.get("context", [])),
             "citation_count": len(node_output.get("citations", [])),
         }
     if node_name == "reviewer":
         return {
+            **base,
             "faithfulness_score": node_output.get("faithfulness_score"),
             "retry_count": node_output.get("retry_count"),
         }
     if node_name == "coder":
-        return {"has_code": bool(node_output.get("code_snippet"))}
-    return {}
+        return {**base, "has_code": bool(node_output.get("code_snippet"))}
+    return base
 
 
 async def _recall_prior_facts(memory: object, req: AskRequest) -> list[str]:
@@ -231,6 +236,7 @@ async def _yield_cache_hit(
                 source=cit.get("source", ""),
                 chunk_id=cit.get("chunk_id"),
                 score=cit.get("score"),
+                text=cit.get("text"),
             )
         )
     yield _sse(
@@ -367,6 +373,7 @@ async def _generate(
         "question": req.question,
         "session_id": req.session_id,
         "tenant_id": req.tenant_id,
+        "force_model": req.model,
         "route": None,
         "model_used": "",
         "context": [],
@@ -377,6 +384,7 @@ async def _generate(
         "errors": [],
         "faithfulness_score": None,
         "retry_count": 0,
+        "latency_ms": None,
     }
 
     final_state: dict = {}  # type: ignore[type-arg]
@@ -411,6 +419,7 @@ async def _generate(
                 source=str(cit.get("source", "")),
                 chunk_id=str(cit.get("chunk_id", "")) or None,
                 score=float(cit["score"]) if cit.get("score") is not None else None,
+                text=str(cit.get("text", "")) or None,
             )
         )
 

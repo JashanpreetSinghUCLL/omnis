@@ -15,6 +15,7 @@ export type AskStreamEvent =
       source: string;
       chunk_id?: string | null;
       score?: number | null;
+      text?: string | null;
     }
   | { type: "cache_hit"; layer: "L1" | "L2" | "L3"; similarity?: number | null }
   | {
@@ -31,6 +32,7 @@ export interface AskPayload {
   question: string;
   tenant_id?: string;
   session_id?: string;
+  model?: string | null;
 }
 
 function parseSseFrames(buffer: string): { frames: string[]; rest: string } {
@@ -60,6 +62,7 @@ function parseEventFrame(frame: string): AskStreamEvent | null {
 export async function streamAsk(
   payload: AskPayload,
   onEvent: (event: AskStreamEvent) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const response = await fetch(`${getApiBaseUrl()}/v1/ask`, {
     method: "POST",
@@ -71,7 +74,9 @@ export async function streamAsk(
       tenant_id: payload.tenant_id ?? "default",
       session_id: payload.session_id ?? "default",
       question: payload.question,
+      ...(payload.model ? { model: payload.model } : {}),
     }),
+    signal,
   });
 
   if (!response.ok || !response.body) {

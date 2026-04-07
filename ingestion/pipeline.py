@@ -152,16 +152,69 @@ async def _mark_stage(redis: Any, content_hash: str, stage: str) -> None:
     await redis.set(_stage_key(content_hash, stage), "1", ex=_REDIS_TTL_S)
 
 
+async def _should_skip(
+    redis: Any, content_hash: str, source: str, result: "IngestionResult"
+) -> bool:
+    """Return True and mutate *result* if this run should be skipped.
+
+    Covers two cases:
+    1. Already fully processed (``done`` key present in Redis).
+    2. Currently being processed by another worker (``lock`` key present).
+    """
+    if await _is_processed(redis, content_hash):
+        logger.info("Document %r already processed — skipping", source)
+        meta = await _get_processed_meta(redis, content_hash)
+        result.chunk_count = meta.get("chunk_count", 0)
+        result.entities_extracted = meta.get("entity_count", 0)
+        result.skipped = True
+        return True
+
+    lock_acquired = await redis.set(
+        f"ingest:lock:{content_hash}", "1", nx=True, ex=7200
+    )
+    if not lock_acquired:
+        logger.info(
+            "Document %r is already being processed by another worker — skipping",
+            source,
+        )
+        result.skipped = True
+        return True
+
+    return False
+
+
 async def _is_processed(redis: Any, content_hash: str) -> bool:
-    """True only when ALL stages have completed."""
-    for stage in ("embed", "graph", "vector"):
-        if not await _stage_done(redis, content_hash, stage):
-            return False
-    return True
+    """True only when the full pipeline completed (``done`` key is set).
+
+    Checking individual stage keys is insufficient because a crashed run can
+    leave some stage keys set without ever reaching ``_mark_processed``.
+    """
+    return await redis.exists(_stage_key(content_hash, "done")) == 1
 
 
-async def _mark_processed(redis: Any, content_hash: str, source: str) -> None:
-    await redis.set(_stage_key(content_hash, "done"), source, ex=_REDIS_TTL_S)
+async def _mark_processed(
+    redis: Any,
+    content_hash: str,
+    source: str,
+    chunk_count: int = 0,
+    entity_count: int = 0,
+) -> None:
+    import json as _json
+    payload = _json.dumps(
+        {"source": source, "chunk_count": chunk_count, "entity_count": entity_count}
+    )
+    await redis.set(_stage_key(content_hash, "done"), payload, ex=_REDIS_TTL_S)
+
+
+async def _get_processed_meta(redis: Any, content_hash: str) -> dict[str, Any]:
+    raw = await redis.get(_stage_key(content_hash, "done"))
+    if not raw:
+        return {}
+    import json as _json
+    try:
+        return _json.loads(raw)  # type: ignore[no-any-return]
+    except Exception:
+        return {}
 
 
 # ── Client factories ──────────────────────────────────────────────────────────
@@ -251,6 +304,36 @@ def _lf_flush() -> None:
         pass
 
 
+async def _run_embed_stage(
+    chunks: Any,
+    redis: Any,
+    content_hash: str,
+    cfg: "IngestionConfig",
+    lf_trace: Any,
+    _cb: Any,
+) -> tuple[Any, float]:
+    """Run (or skip) the embed stage; returns (embedded_chunks, elapsed_s)."""
+    from ingestion.embedder import embed_chunks
+
+    if await _stage_done(redis, content_hash, "embed"):
+        logger.info("Stage embed   — already done, skipping")
+        _cb("embed", "skip", {})
+        embedded = await embed_chunks(chunks, redis=redis, voyage_api_key=None)
+        return embedded, 0.0
+
+    _cb("embed", "start", {"chunk_count": len(chunks)})
+    lf_span = _lf_start_span(lf_trace, "embed", {"chunks": len(chunks)})
+    with _Timer("embed") as t_embed:
+        embedded = await embed_chunks(chunks, redis=redis, voyage_api_key=cfg.voyage_api_key)
+    _lf_end_span(
+        lf_span,
+        {"embedded_count": len(embedded), "elapsed_s": round(t_embed.elapsed, 2)},
+    )
+    _cb("embed", "done", {"count": len(embedded), "elapsed_s": round(t_embed.elapsed, 2)})
+    await _mark_stage(redis, content_hash, "embed")
+    return embedded, t_embed.elapsed
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 
@@ -258,6 +341,7 @@ async def run_ingestion(
     pdf_path: str | Path,
     cfg: IngestionConfig,
     progress_cb: StageCallback | None = None,
+    source_name: str | None = None,
 ) -> IngestionResult:
     """Run the full ingestion pipeline for a single PDF.
 
@@ -272,13 +356,12 @@ async def run_ingestion(
             where event ∈ ``{"start", "done", "skip", "error"}``.
     """
     from ingestion.chunker import chunk_document
-    from ingestion.embedder import embed_chunks
     from ingestion.graph_builder import build_graph
     from ingestion.parser import parse_pdf
     from ingestion.vector_store import push_to_qdrant
 
     pdf_path = Path(pdf_path)
-    source = pdf_path.name
+    source = source_name or pdf_path.name
 
     def _cb(stage: str, event: str, data: dict[str, Any] | None = None) -> None:
         if progress_cb is not None:
@@ -323,10 +406,8 @@ async def run_ingestion(
             doc.parser_used,
         )
 
-        # ── Idempotency gate ──────────────────────────────────────────────────
-        if await _is_processed(redis, doc.content_hash):
-            logger.info("Document %r already processed — skipping", source)
-            result.skipped = True
+        # ── Idempotency + distributed lock ───────────────────────────────────
+        if await _should_skip(redis, doc.content_hash, source, result):
             _cb("*", "skip", {"hash": doc.content_hash[:12]})
             return result
 
@@ -347,29 +428,9 @@ async def run_ingestion(
         logger.info("Chunked into %d chunks", len(chunks))
 
         # ── Stage 3: Embed ────────────────────────────────────────────────────
-        if await _stage_done(redis, doc.content_hash, "embed"):
-            logger.info("Stage embed   — already done, skipping")
-            _cb("embed", "skip", {})
-            # Rebuild embedded list from cache (all hits, no API calls)
-            embedded = await embed_chunks(chunks, redis=redis, voyage_api_key=None)
-        else:
-            _cb("embed", "start", {"chunk_count": len(chunks)})
-            lf_span = _lf_start_span(lf_trace, "embed", {"chunks": len(chunks)})
-            with _Timer("embed") as t_embed:
-                embedded = await embed_chunks(
-                    chunks, redis=redis, voyage_api_key=cfg.voyage_api_key
-                )
-            result.embed_s = t_embed.elapsed
-            _lf_end_span(
-                lf_span,
-                {"embedded_count": len(embedded), "elapsed_s": round(t_embed.elapsed, 2)},
-            )
-            _cb(
-                "embed",
-                "done",
-                {"count": len(embedded), "elapsed_s": round(t_embed.elapsed, 2)},
-            )
-            await _mark_stage(redis, doc.content_hash, "embed")
+        embedded, result.embed_s = await _run_embed_stage(
+            chunks, redis, doc.content_hash, cfg, lf_trace, _cb
+        )
 
         # ── Stage 4: Graph ────────────────────────────────────────────────────
         if await _stage_done(redis, doc.content_hash, "graph"):
@@ -444,7 +505,13 @@ async def run_ingestion(
             await _mark_stage(redis, doc.content_hash, "vector")
 
         # ── Mark fully complete ───────────────────────────────────────────────
-        await _mark_processed(redis, doc.content_hash, source)
+        await _mark_processed(
+            redis,
+            doc.content_hash,
+            source,
+            chunk_count=result.chunk_count,
+            entity_count=result.entities_extracted,
+        )
         logger.info("%s", result)
 
         # Finalise the Langfuse trace with summary metrics
@@ -463,6 +530,12 @@ async def run_ingestion(
                 pass
 
     finally:
+        # Release the processing lock (if we acquired it)
+        if result.content_hash:
+            try:
+                await redis.delete(f"ingest:lock:{result.content_hash}")
+            except Exception:
+                pass
         # Always close connections
         await redis.aclose()
         await qdrant.close()

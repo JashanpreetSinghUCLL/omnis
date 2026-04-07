@@ -1,5 +1,177 @@
-import { useState, useEffect, useRef } from "react";
-import { Search, ZoomIn, ZoomOut, Maximize2, Download, Share2, Layers, Shuffle } from "lucide-react";
+import { useState, useEffect, useRef, useMemo } from "react";
+import { useNavigate } from "react-router";
+import { Search, ZoomIn, ZoomOut, Maximize2, Download, Share2, Layers, Shuffle, RefreshCw, ChevronDown, Check } from "lucide-react";
+import { streamGraphExplore, type ApiGraphNode, type ApiGraphEdge } from "../lib/graphStream";
+import { useUpload } from "../context/UploadContext";
+import { getApiBaseUrl } from "../lib/api";
+
+// ── Source / excerpt helpers ──────────────────────────────────────────────────
+
+/** Strip internal ingestion prefixes (e.g. omnis_ingest_abc123_) and use the
+ *  user-visible document name when we can match one. */
+function cleanSourceName(
+  source: string,
+  docs: Array<{ name: string }>,
+): string {
+  // Try to match against a known doc by exact name or stem
+  const match = docs.find(
+    (d) =>
+      source === d.name ||
+      source.includes(d.name) ||
+      d.name.includes(source.replace(/\.[^.]+$/, "")),
+  );
+  if (match) return match.name;
+  // New ingestions store the original filename — return as-is.
+  return source;
+}
+
+/** Strip <!-- Page N --> HTML-comment markers and normalise whitespace. */
+function cleanExcerpt(text: string): string {
+  return text
+    .replace(/<!--\s*Page\s*\d+\s*-->/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// Entity-type → canvas color mapping
+const ENTITY_COLORS: Record<string, string> = {
+  // ── Actual pipeline entity types (graph_builder.py) ──────────────────────
+  Technology: "#00D9C0",
+  Concept:    "#6B7FFF",
+  API:        "#FFB547",
+  Function:   "#FF4D6A",
+  Module:     "#9B8AFF",
+  // ── Extras / legacy ───────────────────────────────────────────────────────
+  Process:      "#FFB547",
+  Component:    "#FF4D6A",
+  System:       "#00D9C0",
+  Person:       "#6B7FFF",
+  Organization: "#FFB547",
+  Document:     "#9B8AFF",
+  Unknown:      "#888888",
+};
+
+function entityColor(type: string): string {
+  return (
+    ENTITY_COLORS[type] ??
+    `hsl(${type.split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 360}, 60%, 60%)`
+  );
+}
+
+function layoutNodes(apiNodes: ApiGraphNode[], containerW = 1200, containerH = 800): Node[] {
+  const total = apiNodes.length;
+  const cx = containerW / 2;
+  const cy = containerH / 2;
+  const pad = 60;
+
+  return apiNodes.map((n, i) => {
+    // Use server coordinates if available
+    if (n.x != null && n.y != null) {
+      return {
+        id: n.id, label: n.label,
+        x: n.x, y: n.y,
+        size: Math.max(10, Math.min(44, 10 + Math.log1p(n.degree) * 7)),
+        color: entityColor(n.entity_type),
+        type: n.entity_type,
+      };
+    }
+
+    // Multi-ring layout: outer 60 % on outer ring, middle 30 % on mid ring,
+    // top 10 % (high-degree hubs) clustered near center — all pre-spread so
+    // the force layout never starts from a tight cluster.
+    const tier = i / total;
+    let r: number;
+    if (tier < 0.1) {
+      r = Math.min(containerW, containerH) * 0.10;      // hub ring
+    } else if (tier < 0.4) {
+      r = Math.min(containerW, containerH) * 0.28;      // mid ring
+    } else {
+      // outer nodes: use multiple concentric rings every 100 px
+      const outerIdx = i - Math.floor(total * 0.4);
+      const outerTotal = total - Math.floor(total * 0.4);
+      const ringCount = Math.max(1, Math.floor((Math.min(containerW, containerH) * 0.5 - 100) / 100));
+      const ringIdx = Math.floor((outerIdx / outerTotal) * ringCount);
+      r = Math.min(containerW, containerH) * 0.45 + ringIdx * 90;
+    }
+    // Clamp so nodes don't leave the canvas
+    r = Math.min(r, Math.min(containerW / 2 - pad, containerH / 2 - pad));
+    const angle = (i / total) * Math.PI * 2 - Math.PI / 2;
+    return {
+      id: n.id, label: n.label,
+      x: cx + Math.cos(angle) * r,
+      y: cy + Math.sin(angle) * r,
+      size: Math.max(12, Math.min(32, 12 + Math.log1p(n.degree) * 5)),
+      color: entityColor(n.entity_type),
+      type: n.entity_type,
+    };
+  });
+}
+
+function applyForceLayout(
+  inputNodes: Node[],
+  inputEdges: Edge[],
+  containerW = 1200,
+  containerH = 800,
+): Node[] {
+  const n = inputNodes.length;
+  if (n === 0) return inputNodes;
+
+  // Scale iterations down for large graphs so the main thread doesn't block
+  const iters = Math.max(40, Math.round(200 * Math.min(1, 60 / n)));
+
+  // Build an index so edge lookups are O(1)
+  const idx = new Map(inputNodes.map((node, i) => [node.id, i]));
+  const pos = inputNodes.map(node => ({ ...node }));
+
+  for (let iter = 0; iter < iters; iter++) {
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const dx = pos[j].x - pos[i].x || 0.01;
+        const dy = pos[j].y - pos[i].y || 0.01;
+        const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+        const f = 7500 / (dist * dist);
+        pos[i].x -= (dx / dist) * f;
+        pos[i].y -= (dy / dist) * f;
+        pos[j].x += (dx / dist) * f;
+        pos[j].y += (dy / dist) * f;
+      }
+    }
+    for (const edge of inputEdges) {
+      const si = idx.get(edge.source);
+      const ti = idx.get(edge.target);
+      if (si == null || ti == null) continue;
+      const s = pos[si], t = pos[ti];
+      const dx = t.x - s.x;
+      const dy = t.y - s.y;
+      const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+      const f = (dist - 200) * 0.012;
+      s.x += (dx / dist) * f;
+      s.y += (dy / dist) * f;
+      t.x -= (dx / dist) * f;
+      t.y -= (dy / dist) * f;
+    }
+  }
+
+  // Normalize all positions back into the viewport so nodes never fly off-screen
+  const pad = 80;
+  const xs = pos.map(p => p.x);
+  const ys = pos.map(p => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const rangeX = maxX - minX || 1;
+  const rangeY = maxY - minY || 1;
+  const scaleX = (containerW - pad * 2) / rangeX;
+  const scaleY = (containerH - pad * 2) / rangeY;
+  const scale = Math.min(scaleX, scaleY);
+  const offX = pad + ((containerW - pad * 2) - rangeX * scale) / 2;
+  const offY = pad + ((containerH - pad * 2) - rangeY * scale) / 2;
+
+  return pos.map(p => ({
+    ...p,
+    x: offX + (p.x - minX) * scale,
+    y: offY + (p.y - minY) * scale,
+  }));
+}
 
 interface Node {
   id: string;
@@ -14,6 +186,7 @@ interface Node {
 interface Edge {
   source: string;
   target: string;
+  relation?: string;    // Neo4j relationship type, e.g. DEPENDS_ON, USES, CALLS
 }
 
 type TabType = "Overview" | "Connections" | "Sources";
@@ -99,6 +272,16 @@ function OrbitalMiniMap({ node, connNodes }: { node: Node; connNodes: Node[] }) 
   );
 }
 
+// ── Node detail types (from /v1/graph/node/{id}/detail) ──────────────────────
+interface NodeDetail {
+  description: string;
+  out_degree: number;
+  in_degree: number;
+  out_relations: string[];
+  in_relations: string[];
+  properties: Record<string, string | number | boolean>;
+}
+
 // ── Node Inspector Panel ──────────────────────────────────────────────────────
 function NodeInspector({
   node,
@@ -106,17 +289,40 @@ function NodeInspector({
   edges,
   onClose,
   onNavigate,
+  indexedDocs,
+  onAsk,
 }: {
   node: Node;
   nodes: Node[];
   edges: Edge[];
   onClose: () => void;
   onNavigate: (n: Node) => void;
+  indexedDocs: Array<{ name: string }>;
+  onAsk: (label: string) => void;
 }) {
   const [activeTab, setActiveTab] = useState<TabType>("Overview");
+  const [nodeSources, setNodeSources] = useState<Array<{ source: string; pages: string[]; excerpts: string[] }>>([]);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [nodeDetail, setNodeDetail] = useState<NodeDetail | null>(null);
 
   useEffect(() => {
     setActiveTab("Overview");
+    setNodeSources([]);
+    setNodeDetail(null);
+    setSourcesLoading(true);
+
+    const base = getApiBaseUrl();
+    // Fetch both detail and sources in parallel
+    Promise.all([
+      fetch(`${base}/v1/graph/node/${node.id}/detail`).then(r => r.json()),
+      fetch(`${base}/v1/graph/node/${node.id}/sources`).then(r => r.json()),
+    ]).then(([detail, sourcesData]) => {
+      setNodeDetail(detail as NodeDetail);
+      setNodeSources((sourcesData as { sources?: Array<{ source: string; pages: string[]; excerpts: string[] }> }).sources ?? []);
+    }).catch(() => {
+      setNodeDetail(null);
+      setNodeSources([]);
+    }).finally(() => setSourcesLoading(false));
   }, [node.id]);
 
   const connEdges = edges.filter(e => e.source === node.id || e.target === node.id);
@@ -125,53 +331,25 @@ function NodeInspector({
     .filter(Boolean) as Node[];
 
   const outEdges = edges.filter(e => e.source === node.id);
-  const inEdges = edges.filter(e => e.target === node.id);
-  const relevance = Math.round((node.size / 32) * 100);
+  const inEdges  = edges.filter(e => e.target === node.id);
 
-  const typeDescriptions: Record<string, string> = {
-    Concept:   "A foundational idea forming the theoretical backbone of this knowledge domain.",
-    Component: "A structural building block embedded within larger systems and architectures.",
-    Process:   "An algorithmic procedure that transforms inputs into meaningful outputs.",
-    System:    "A complete integrated architecture combining multiple components and subsystems.",
-  };
-  const description =
-    typeDescriptions[node.type] ??
-    "A key entity with multiple interconnected relationships across the knowledge graph.";
+  // Use real degree from Neo4j (detail) when available, fall back to loaded subgraph degree
+  const totalDegree = nodeDetail
+    ? nodeDetail.out_degree + nodeDetail.in_degree
+    : connEdges.length;
 
   const props = [
-    { key: "entity.type",     val: node.type },
-    { key: "entity.id",       val: `#${String(node.id).padStart(4, "0")}` },
-    { key: "graph.weight",    val: String(node.size) },
-    { key: "graph.degree",    val: String(connEdges.length) },
-    { key: "index.relevance", val: `${relevance}%` },
-    { key: "refs.documents",  val: "2" },
-  ];
-
-  const activity = [
-    { time: "2h ago", action: "Referenced in", doc: "Deep_Learning_Fundamentals.pdf" },
-    { time: "1d ago", action: "Linked from",   doc: "Neural_Architecture_Search.pdf" },
-    { time: "3d ago", action: "Indexed from",  doc: "Introduction_to_AI.pdf" },
-  ];
-
-  const documents = [
-    {
-      name: "Introduction_to_AI.pdf",
-      page: 12,
-      excerpt:
-        "Referenced in the context of neural network fundamentals and the mathematical basis of deep learning architectures.",
-    },
-    {
-      name: "Deep_Learning_Fundamentals.pdf",
-      page: 45,
-      excerpt:
-        "Core concept discussed in relation to backpropagation, gradient descent, and loss convergence methods.",
-    },
+    { key: "TYPE",      val: node.type },
+    { key: "OUTBOUND",  val: nodeDetail ? String(nodeDetail.out_degree) : String(outEdges.length) },
+    { key: "INBOUND",   val: nodeDetail ? String(nodeDetail.in_degree)  : String(inEdges.length)  },
+    { key: "DOCUMENTS", val: sourcesLoading ? "…" : String(nodeSources.length) },
+    { key: "DEGREE",    val: String(totalDegree) },
   ];
 
   const stats = [
-    { val: connEdges.length, label: "connections" },
-    { val: 2,                label: "documents"   },
-    { val: `${relevance}%`,  label: "relevance"   },
+    { val: totalDegree,                                              label: "degree"    },
+    { val: sourcesLoading ? "…" : nodeSources.length,               label: "documents" },
+    { val: nodeDetail ? nodeDetail.out_relations.length + nodeDetail.in_relations.length : "…", label: "rel. types" },
   ];
 
   const tabs: TabType[] = ["Overview", "Connections", "Sources"];
@@ -366,116 +544,85 @@ function NodeInspector({
 
         {/* OVERVIEW */}
         {activeTab === "Overview" && (
-          <div className="p-5 space-y-6">
-            {/* Description */}
-            <p
-              style={{
-                fontSize: "12.5px",
-                color: "var(--text-secondary)",
-                lineHeight: 1.7,
-                borderLeft: `2px solid ${node.color}45`,
-                paddingLeft: "12px",
-                margin: 0,
-              }}
-            >
-              {description} This node maintains {connEdges.length} active{" "}
-              relationship{connEdges.length !== 1 ? "s" : ""} and is referenced across{" "}
-              {Math.floor(node.size / 10)} research domains.
-            </p>
+          <div className="p-5 space-y-5">
+            {/* Description — from Neo4j if available, otherwise synthesised */}
+            <div style={{ borderRadius: "8px", padding: "12px 14px", background: `${node.color}0D`, border: `1px solid ${node.color}28` }}>
+              {sourcesLoading ? (
+                <p style={{ fontSize: "12.5px", color: "var(--text-tertiary)", lineHeight: 1.7, margin: 0, fontFamily: "var(--font-mono)" }}>Loading…</p>
+              ) : nodeDetail?.description ? (
+                <p style={{ fontSize: "12.5px", color: "var(--text-secondary)", lineHeight: 1.75, margin: 0 }}>
+                  {nodeDetail.description}
+                </p>
+              ) : (
+                <p style={{ fontSize: "12.5px", color: "var(--text-secondary)", lineHeight: 1.75, margin: 0 }}>
+                  <span style={{ color: node.color, fontWeight: 600 }}>{node.label}</span>
+                  {" "}is a <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{node.type}</span> with{" "}
+                  <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{totalDegree} relationship{totalDegree !== 1 ? "s" : ""}</span>
+                  {!sourcesLoading && nodeSources.length > 0 && (
+                    <>, referenced in <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{nodeSources.length} document{nodeSources.length !== 1 ? "s" : ""}</span></>
+                  )}.
+                </p>
+              )}
+            </div>
 
-            {/* Properties table */}
+            {/* Properties table — real degree from Neo4j, no fake centrality */}
             <div>
-              <div
-                style={{
-                  fontSize: "9.5px",
-                  fontFamily: "var(--font-mono)",
-                  color: "var(--text-tertiary)",
-                  letterSpacing: "0.1em",
-                  textTransform: "uppercase",
-                  marginBottom: "8px",
-                }}
-              >
-                Entity Properties
+              <div style={{ fontSize: "9.5px", fontFamily: "var(--font-mono)", color: "var(--text-tertiary)", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: "8px" }}>
+                Properties
               </div>
               <div style={{ borderTop: "1px solid var(--border)" }}>
                 {props.map(p => (
-                  <div
-                    key={p.key}
-                    className="flex items-center justify-between py-2"
-                    style={{ borderBottom: "1px solid var(--border)" }}
-                  >
-                    <span style={{ fontFamily: "var(--font-mono)", fontSize: "10.5px", color: "var(--text-tertiary)" }}>
-                      {p.key}
-                    </span>
-                    <span
-                      style={{
-                        fontFamily: "var(--font-mono)",
-                        fontSize: "10.5px",
-                        color: "var(--text-primary)",
-                        background: "var(--elevated)",
-                        padding: "2px 8px",
-                        borderRadius: "4px",
-                        border: "1px solid var(--border)",
-                      }}
-                    >
-                      {p.val}
-                    </span>
+                  <div key={p.key} className="flex items-center justify-between py-2" style={{ borderBottom: "1px solid var(--border)" }}>
+                    <span style={{ fontFamily: "var(--font-mono)", fontSize: "10.5px", color: "var(--text-tertiary)", letterSpacing: "0.06em" }}>{p.key}</span>
+                    <span style={{ fontFamily: "var(--font-mono)", fontSize: "10.5px", color: "var(--text-primary)", background: "var(--elevated)", padding: "2px 8px", borderRadius: "4px", border: "1px solid var(--border)" }}>{p.val}</span>
                   </div>
                 ))}
               </div>
             </div>
 
-            {/* Activity timeline */}
-            <div>
-              <div
-                style={{
-                  fontSize: "9.5px",
-                  fontFamily: "var(--font-mono)",
-                  color: "var(--text-tertiary)",
-                  letterSpacing: "0.1em",
-                  textTransform: "uppercase",
-                  marginBottom: "8px",
-                }}
-              >
-                Recent Activity
+            {/* Relationship types from Neo4j */}
+            {nodeDetail && (nodeDetail.out_relations.length > 0 || nodeDetail.in_relations.length > 0) && (
+              <div>
+                <div style={{ fontSize: "9.5px", fontFamily: "var(--font-mono)", color: "var(--text-tertiary)", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: "8px" }}>
+                  Relationship Types
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                  {[...new Set([...nodeDetail.out_relations, ...nodeDetail.in_relations])].map(r => (
+                    <span key={r} style={{ fontFamily: "var(--font-mono)", fontSize: "10px", color: node.color, background: `${node.color}14`, padding: "2px 8px", borderRadius: "4px", border: `1px solid ${node.color}28`, letterSpacing: "0.04em" }}>
+                      {r}
+                    </span>
+                  ))}
+                </div>
               </div>
-              <div style={{ borderTop: "1px solid var(--border)" }}>
-                {activity.map((a, i) => (
-                  <div
-                    key={i}
-                    className="flex items-start gap-3 py-2.5"
-                    style={{ borderBottom: "1px solid var(--border)" }}
-                  >
-                    <div
-                      style={{
-                        width: "6px",
-                        height: "6px",
-                        borderRadius: "50%",
-                        background: i === 0 ? node.color : "var(--border-hover)",
-                        marginTop: "4px",
-                        flexShrink: 0,
-                      }}
-                    />
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: 1.4 }}>
-                        {a.action}{" "}
-                        <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{a.doc}</span>
-                      </div>
-                      <div
-                        style={{
-                          fontSize: "10px",
-                          fontFamily: "var(--font-mono)",
-                          color: "var(--text-tertiary)",
-                          marginTop: "2px",
-                        }}
+            )}
+
+            {/* Top connections (from loaded subgraph) */}
+            {connNodes.length > 0 && (
+              <div>
+                <div style={{ fontSize: "9.5px", fontFamily: "var(--font-mono)", color: "var(--text-tertiary)", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: "8px" }}>
+                  Neighbours in View
+                </div>
+                <div className="space-y-1.5">
+                  {connNodes.slice(0, 6).map(cn => {
+                    const edgeToNode = connEdges.find(e => (e.source === node.id && e.target === cn.id) || (e.target === node.id && e.source === cn.id));
+                    return (
+                      <button key={cn.id} onClick={() => onNavigate(cn)} className="w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-lg transition-all" style={{ background: "var(--elevated)", border: "1px solid var(--border)", cursor: "pointer" }}
+                        onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = cn.color + "60"; }}
+                        onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--border)"; }}
                       >
-                        {a.time}
-                      </div>
-                    </div>
-                  </div>
-                ))}
+                        <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: cn.color, flexShrink: 0 }} />
+                        <span style={{ fontSize: "12px", color: "var(--text-primary)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{cn.label}</span>
+                        {edgeToNode?.relation && (
+                          <span style={{ fontFamily: "var(--font-mono)", fontSize: "9px", color: "var(--text-tertiary)", flexShrink: 0, background: "var(--surface)", padding: "1px 5px", borderRadius: "3px" }}>
+                            {edgeToNode.relation}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
+            )}
           </div>
         )}
 
@@ -488,29 +635,22 @@ function NodeInspector({
               return (
                 <div key={dir}>
                   <div className="flex items-center gap-2 mb-3">
-                    <span
-                      style={{
-                        fontSize: "9.5px",
-                        fontFamily: "var(--font-mono)",
-                        color: "var(--text-tertiary)",
-                        textTransform: "uppercase",
-                        letterSpacing: "0.1em",
-                      }}
-                    >
+                    <span style={{ fontSize: "9.5px", fontFamily: "var(--font-mono)", color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: "0.1em" }}>
                       {dir}
                     </span>
-                    <span
-                      style={{
-                        fontSize: "9px",
-                        fontFamily: "var(--font-mono)",
-                        color: node.color,
-                        background: `${node.color}14`,
-                        padding: "1px 6px",
-                        borderRadius: "10px",
-                      }}
-                    >
+                    <span style={{ fontSize: "9px", fontFamily: "var(--font-mono)", color: node.color, background: `${node.color}14`, padding: "1px 6px", borderRadius: "10px" }}>
                       {dirEdges.length}
                     </span>
+                    {nodeDetail && dir === "Outbound" && nodeDetail.out_degree > dirEdges.length && (
+                      <span style={{ fontSize: "9px", color: "var(--text-tertiary)", fontFamily: "var(--font-mono)" }}>
+                        ({nodeDetail.out_degree} in KB)
+                      </span>
+                    )}
+                    {nodeDetail && dir === "Inbound" && nodeDetail.in_degree > dirEdges.length && (
+                      <span style={{ fontSize: "9px", color: "var(--text-tertiary)", fontFamily: "var(--font-mono)" }}>
+                        ({nodeDetail.in_degree} in KB)
+                      </span>
+                    )}
                     <div className="flex-1 h-px" style={{ background: "var(--border)" }} />
                   </div>
 
@@ -565,39 +705,22 @@ function NodeInspector({
                           </div>
 
                           <div style={{ flex: 1, minWidth: 0 }}>
-                            <div
-                              style={{
-                                fontSize: "12px",
-                                fontWeight: 500,
-                                color: "var(--text-primary)",
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                whiteSpace: "nowrap",
-                              }}
-                            >
+                            <div style={{ fontSize: "12px", fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                               {rel.label}
                             </div>
-                            <div
-                              style={{
-                                fontSize: "9.5px",
-                                fontFamily: "var(--font-mono)",
-                                color: "var(--text-tertiary)",
-                                marginTop: "1px",
-                              }}
-                            >
-                              {rel.type}
+                            <div style={{ display: "flex", alignItems: "center", gap: "5px", marginTop: "3px" }}>
+                              <span style={{ fontSize: "9.5px", fontFamily: "var(--font-mono)", color: "var(--text-tertiary)" }}>
+                                {rel.type}
+                              </span>
+                              {edge.relation && (
+                                <span style={{ fontFamily: "var(--font-mono)", fontSize: "9px", color: node.color, background: `${node.color}14`, padding: "1px 5px", borderRadius: "3px", border: `1px solid ${node.color}25`, letterSpacing: "0.03em" }}>
+                                  {edge.relation}
+                                </span>
+                              )}
                             </div>
                           </div>
 
-                          <div
-                            style={{
-                              fontFamily: "var(--font-mono)",
-                              fontSize: "11px",
-                              color: rel.color,
-                              opacity: 0.7,
-                              flexShrink: 0,
-                            }}
-                          >
+                          <div style={{ fontFamily: "var(--font-mono)", fontSize: "11px", color: rel.color, opacity: 0.7, flexShrink: 0 }}>
                             {dir === "Outbound" ? "→" : "←"}
                           </div>
                         </button>
@@ -613,32 +736,33 @@ function NodeInspector({
         {/* SOURCES */}
         {activeTab === "Sources" && (
           <div className="p-5 space-y-3">
-            {documents.map((doc, i) => (
-              <div
-                key={i}
-                style={{
-                  borderRadius: "10px",
-                  overflow: "hidden",
-                  border: "1px solid var(--border)",
-                  background: "var(--elevated)",
-                }}
-              >
+            {sourcesLoading ? (
+              <div className="py-8 text-center" style={{ fontSize: "12px", color: "var(--text-tertiary)", fontFamily: "var(--font-mono)" }}>
+                Loading sources…
+              </div>
+            ) : nodeSources.length === 0 ? (
+              <div className="py-8 text-center" style={{ fontSize: "12px", color: "var(--text-tertiary)", fontFamily: "var(--font-mono)" }}>
+                No sources found for this entity.
+              </div>
+            ) : nodeSources.map((doc) => {
+              const friendlyName = cleanSourceName(doc.source, indexedDocs);
+              const allPages = doc.pages.filter(Boolean);
+              const cleanedExcerpts = doc.excerpts.map(cleanExcerpt).filter(Boolean);
+              return (
                 <div
-                  className="flex items-center justify-between px-4 py-3"
-                  style={{ borderBottom: "1px solid var(--border)", background: "var(--surface)" }}
+                  key={doc.source}
+                  style={{ borderRadius: "10px", overflow: "hidden", border: "1px solid var(--border)", background: "var(--elevated)" }}
                 >
-                  <div className="flex items-center gap-2.5" style={{ minWidth: 0, flex: 1 }}>
+                  {/* Header */}
+                  <div
+                    className="flex items-start gap-3 px-4 py-3"
+                    style={{ background: "var(--surface)", borderBottom: cleanedExcerpts.length > 0 ? "1px solid var(--border)" : "none" }}
+                  >
                     <div
                       style={{
-                        width: "28px",
-                        height: "28px",
-                        borderRadius: "6px",
-                        background: `${node.color}14`,
-                        border: `1px solid ${node.color}30`,
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        flexShrink: 0,
+                        width: "28px", height: "28px", borderRadius: "6px",
+                        background: `${node.color}14`, border: `1px solid ${node.color}30`,
+                        display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: "1px",
                       }}
                     >
                       <svg width="11" height="13" viewBox="0 0 11 13" fill="none">
@@ -647,70 +771,48 @@ function NodeInspector({
                         <path d="M3 6.5h5M3 8.5h3.5" stroke={node.color} strokeWidth="0.75" strokeLinecap="round" />
                       </svg>
                     </div>
-                    <span
-                      style={{
-                        fontSize: "11.5px",
-                        fontWeight: 500,
-                        color: "var(--text-primary)",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {doc.name}
-                    </span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {friendlyName}
+                      </div>
+                      {allPages.length > 0 && (
+                        <div style={{ marginTop: "4px", display: "flex", flexWrap: "wrap", gap: "4px" }}>
+                          {allPages.map((pg) => (
+                            <span
+                              key={pg}
+                              style={{
+                                fontFamily: "var(--font-mono)", fontSize: "9.5px",
+                                color: node.color, background: `${node.color}14`,
+                                padding: "1px 6px", borderRadius: "4px",
+                              }}
+                            >
+                              p.{pg}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
-                  <span
-                    style={{
-                      fontFamily: "var(--font-mono)",
-                      fontSize: "10px",
-                      color: node.color,
-                      background: `${node.color}14`,
-                      padding: "2px 8px",
-                      borderRadius: "4px",
-                      flexShrink: 0,
-                      marginLeft: "8px",
-                    }}
-                  >
-                    p.{doc.page}
-                  </span>
-                </div>
 
-                <div className="px-4 py-3">
-                  <p
-                    style={{
-                      fontSize: "11.5px",
-                      color: "var(--text-tertiary)",
-                      lineHeight: 1.65,
-                      margin: 0,
-                      display: "-webkit-box",
-                      WebkitLineClamp: 3,
-                      WebkitBoxOrient: "vertical" as const,
-                      overflow: "hidden",
-                    }}
-                  >
-                    {doc.excerpt}
-                  </p>
-                  <button
-                    className="mt-2.5 transition-opacity"
-                    style={{
-                      fontSize: "11px",
-                      fontFamily: "var(--font-mono)",
-                      color: node.color,
-                      background: "none",
-                      border: "none",
-                      cursor: "pointer",
-                      padding: 0,
-                      opacity: 0.75,
-                    }}
-                    onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.opacity = "1")}
-                    onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.opacity = "0.75")}
-                  >
-                    View in Documents →
-                  </button>
+                  {/* Excerpts */}
+                  {cleanedExcerpts.length > 0 && (
+                    <div className="px-4 py-3 space-y-2">
+                      {cleanedExcerpts.slice(0, 3).map((excerpt, ei) => (
+                        <p
+                          key={ei}
+                          style={{
+                            fontSize: "11.5px", color: "var(--text-secondary)", lineHeight: 1.65,
+                            margin: 0, paddingLeft: "10px", borderLeft: `2px solid ${node.color}35`,
+                          }}
+                        >
+                          {excerpt.length > 220 ? excerpt.slice(0, 220) + "…" : excerpt}
+                        </p>
+                      ))}
+                    </div>
+                  )}
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -743,11 +845,13 @@ function NodeInspector({
             el.style.borderColor = "var(--border)";
             el.style.color = "var(--text-secondary)";
           }}
+          onClick={() => navigator.clipboard.writeText(node.label)}
         >
-          Copy ID
+          Copy name
         </button>
 
         <button
+          onClick={() => onAsk(node.label)}
           className="transition-all flex items-center justify-center gap-2"
           style={{
             flex: 2,
@@ -784,6 +888,7 @@ function NodeInspector({
 
 // ── Main Component ────────────────────────────────────────────────────────────
 export default function KnowledgeGraph() {
+  const navigate = useNavigate();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [selectedNode, setSelectedNode] = useState<Node | null>(null);
@@ -793,9 +898,22 @@ export default function KnowledgeGraph() {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [activeFilter, setActiveFilter] = useState("All");
+  const [searchQuery, setSearchQuery] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [colors, setColors] = useState<ReturnType<typeof getThemeColors> | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
+  const [selectedSource, setSelectedSource] = useState<string | null>(null);
+  const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
+  const [nodeLimit, setNodeLimit] = useState<number>(75);
+  const NODE_LIMIT_OPTIONS = [25, 50, 75, 100, 200, 500, 2000] as const;
+  // Real Neo4j document source names (may differ from UploadContext display names)
+  const [neo4jSources, setNeo4jSources] = useState<string[]>([]);
+  // KB-wide stats from Neo4j — used to show "X of Y total" in the overlay
+  const [kbStats, setKbStats] = useState<{ total_entities: number; total_relations: number; total_documents: number } | null>(null);
+  const { documents } = useUpload();
+  const indexedDocs = documents.filter((d) => d.status === "indexed");
 
   // ── Node-drag physics refs ─────────────────────────────────────────────────
   const draggingNodeIdRef  = useRef<string | null>(null);
@@ -804,6 +922,23 @@ export default function KnowledgeGraph() {
   const lastMouseWorldRef  = useRef({ x: 0, y: 0 });
   const throwFrameRef      = useRef<number | null>(null);
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null); // for visual
+
+  const displayNodes = useMemo(() => {
+    let result = nodes;
+    if (activeFilter !== "All") {
+      result = result.filter(n => n.type === activeFilter);
+    }
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      result = result.filter(n => n.label.toLowerCase().includes(q));
+    }
+    return result;
+  }, [nodes, activeFilter, searchQuery]);
+
+  const displayEdges = useMemo(() => {
+    const nodeIds = new Set(displayNodes.map(n => n.id));
+    return edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
+  }, [edges, displayNodes]);
 
   const getThemeColors = () => {
     const root = document.documentElement;
@@ -830,44 +965,65 @@ export default function KnowledgeGraph() {
     return () => observer.disconnect();
   }, []);
 
+  // ── Load Neo4j metadata (sources + KB-wide stats) on mount / refresh ─────────
   useEffect(() => {
-    const centerX = 600;
-    const centerY = 400;
+    const base = getApiBaseUrl();
+    Promise.all([
+      fetch(`${base}/v1/graph/sources`).then(r => r.json()),
+      fetch(`${base}/v1/graph/stats`).then(r => r.json()),
+    ]).then(([srcData, statsData]) => {
+      setNeo4jSources((srcData as { sources?: string[] }).sources ?? []);
+      setKbStats(statsData as { total_entities: number; total_relations: number; total_documents: number });
+    }).catch(() => {/* non-fatal */});
+  }, [refreshKey]);
 
-    const sampleNodes: Node[] = [
-      { id: "1",  label: "Neural Networks",      x: centerX,       y: centerY - 100, size: 32, color: "#00D9C0", type: "Concept"   },
-      { id: "2",  label: "Deep Learning",         x: centerX - 200, y: centerY,       size: 28, color: "#6B7FFF", type: "Concept"   },
-      { id: "3",  label: "Backpropagation",       x: centerX + 200, y: centerY,       size: 24, color: "#FFB547", type: "Process"   },
-      { id: "4",  label: "Activation Functions",  x: centerX - 150, y: centerY + 150, size: 22, color: "#00D9C0", type: "Component" },
-      { id: "5",  label: "Gradient Descent",      x: centerX + 150, y: centerY + 150, size: 22, color: "#FFB547", type: "Process"   },
-      { id: "6",  label: "CNN",                   x: centerX - 300, y: centerY - 50,  size: 20, color: "#6B7FFF", type: "System"    },
-      { id: "7",  label: "RNN",                   x: centerX - 250, y: centerY + 200, size: 20, color: "#6B7FFF", type: "System"    },
-      { id: "8",  label: "Transformer",           x: centerX + 100, y: centerY + 250, size: 26, color: "#6B7FFF", type: "System"    },
-      { id: "9",  label: "Attention",             x: centerX + 280, y: centerY + 200, size: 24, color: "#00D9C0", type: "Component" },
-      { id: "10", label: "Loss Function",         x: centerX + 120, y: centerY - 180, size: 20, color: "#FFB547", type: "Process"   },
-      { id: "11", label: "Optimizer",             x: centerX + 300, y: centerY + 50,  size: 18, color: "#FFB547", type: "Process"   },
-      { id: "12", label: "LSTM",                  x: centerX - 350, y: centerY + 100, size: 18, color: "#6B7FFF", type: "System"    },
-    ];
+  // ── Load graph data ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    setIsLoading(true);
+    setNodes([]);
+    setEdges([]);
 
-    const sampleEdges: Edge[] = [
-      { source: "1",  target: "2"  },
-      { source: "1",  target: "3"  },
-      { source: "1",  target: "10" },
-      { source: "2",  target: "4"  },
-      { source: "2",  target: "6"  },
-      { source: "2",  target: "7"  },
-      { source: "2",  target: "8"  },
-      { source: "3",  target: "5"  },
-      { source: "8",  target: "9"  },
-      { source: "4",  target: "7"  },
-      { source: "7",  target: "12" },
-      { source: "5",  target: "11" },
-      { source: "9",  target: "11" },
-    ];
+    async function loadGraph() {
+      const apiNodes: ApiGraphNode[] = [];
+      const apiEdges: ApiGraphEdge[] = [];
 
-    setNodes(sampleNodes);
-    setEdges(sampleEdges);
-  }, []);
+      try {
+        for await (const event of streamGraphExplore({ limit: Math.min(nodeLimit, 2000), source: selectedSource ?? undefined })) {
+          if (cancelled) return;
+          if (event.type === "node") {
+            apiNodes.push(event);
+          } else if (event.type === "edge") {
+            apiEdges.push(event);
+          } else if (event.type === "done") {
+            const container = containerRef.current;
+            const w = container?.offsetWidth ?? 1200;
+            const h = container?.offsetHeight ?? 800;
+            const sorted = [...apiNodes].sort((a, b) => (b.degree ?? 0) - (a.degree ?? 0)).slice(0, nodeLimit);
+            const topIds = new Set(sorted.map(n => n.id));
+            const trimmedEdges = apiEdges
+              .filter(e => topIds.has(e.source) && topIds.has(e.target))
+              .map(e => ({ source: e.source, target: e.target, relation: e.relation }));
+            const layouted = layoutNodes(sorted, w, h);
+            const positioned = applyForceLayout(layouted, trimmedEdges, w, h);
+            if (!cancelled) {
+              setNodes(positioned);
+              setEdges(trimmedEdges);
+              // Auto-fit: reset zoom/pan so the freshly loaded graph fills the view
+              setZoom(1);
+              setPan({ x: 0, y: 0 });
+              setIsLoading(false);
+            }
+          }
+        }
+      } catch {
+        if (!cancelled) setIsLoading(false);
+      }
+    }
+
+    loadGraph();
+    return () => { cancelled = true; };
+  }, [refreshKey, selectedSource, nodeLimit]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -939,9 +1095,28 @@ export default function KnowledgeGraph() {
       }
     }
 
-    edges.forEach(edge => {
-      const sourceNode = nodes.find(n => n.id === edge.source);
-      const targetNode = nodes.find(n => n.id === edge.target);
+    // Pre-compute which nodes are connected to the selected node (for focus dimming)
+    const selectedNeighborIds = selectedNode
+      ? new Set(
+          displayEdges
+            .filter(e => e.source === selectedNode.id || e.target === selectedNode.id)
+            .flatMap(e => [e.source, e.target])
+        )
+      : null;
+
+    // ── LOD: pre-compute degree map for label gating ─────────────────────────
+    const degreeMap = new Map<string, number>();
+    displayEdges.forEach(e => {
+      degreeMap.set(e.source, (degreeMap.get(e.source) ?? 0) + 1);
+      degreeMap.set(e.target, (degreeMap.get(e.target) ?? 0) + 1);
+    });
+    const sortedDegrees = [...degreeMap.values()].sort((a, b) => a - b);
+    // Top 15% of nodes by degree get labels at normal zoom
+    const p85Degree = sortedDegrees[Math.floor(sortedDegrees.length * 0.85)] ?? 1;
+
+    displayEdges.forEach(edge => {
+      const sourceNode = displayNodes.find(n => n.id === edge.source);
+      const targetNode = displayNodes.find(n => n.id === edge.target);
       if (sourceNode && targetNode) {
         const isConnectedToHovered =
           hoveredNode && (sourceNode.id === hoveredNode.id || targetNode.id === hoveredNode.id);
@@ -970,15 +1145,44 @@ export default function KnowledgeGraph() {
         ctx.moveTo(sourceNode.x, sourceNode.y);
         ctx.lineTo(targetNode.x, targetNode.y);
         ctx.stroke();
+        ctx.shadowBlur = 0;
+
+        // Draw relationship label at edge midpoint when edge is active
+        if ((isConnectedToHovered || isConnectedToSelected) && edge.relation && zoom >= 0.7) {
+          const mx = (sourceNode.x + targetNode.x) / 2;
+          const my = (sourceNode.y + targetNode.y) / 2;
+          const label = edge.relation;
+          const fontSize = Math.max(9, Math.round(11 / zoom));
+          ctx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
+          const tw = ctx.measureText(label).width;
+          const pad = 5;
+          // pill background
+          ctx.globalAlpha = 0.88;
+          ctx.fillStyle = colors.isDark ? "#0D1520" : "#FFFFFF";
+          const rr = fontSize * 0.6;
+          ctx.beginPath();
+          ctx.roundRect(mx - tw / 2 - pad, my - fontSize * 0.75, tw + pad * 2, fontSize * 1.5, rr);
+          ctx.fill();
+          // label text
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = colors.isDark ? "#00D9C0" : "#007A70";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText(label, mx, my);
+          ctx.textBaseline = "alphabetic";
+        }
       }
     });
 
     ctx.globalAlpha = 1;
     ctx.shadowBlur = 0;
-    nodes.forEach(node => {
+    displayNodes.forEach(node => {
       const isSelected = selectedNode?.id === node.id;
       const isHovered  = hoveredNode?.id  === node.id;
       const isGrabbed  = draggingNodeId   === node.id;
+      // Dim nodes not connected to the selected node (focus mode)
+      const isFaded = selectedNeighborIds !== null && !selectedNeighborIds.has(node.id);
+      const nodeAlpha = isFaded ? 0.12 : 1;
 
       // ── Grabbed outer ring (dashed) ──────────────────────────────────────
       if (isGrabbed) {
@@ -994,7 +1198,7 @@ export default function KnowledgeGraph() {
         ctx.restore();
 
         // Proximity snap lines to nearby nodes
-        nodes.forEach(other => {
+        displayNodes.forEach(other => {
           if (other.id === node.id) return;
           const dx = other.x - node.x;
           const dy = other.y - node.y;
@@ -1023,9 +1227,9 @@ export default function KnowledgeGraph() {
       ctx.beginPath();
       ctx.arc(node.x, node.y, node.size / 2 + (isGrabbed ? 18 : 12), 0, Math.PI * 2);
       ctx.fillStyle = isSelected || isHovered || isGrabbed ? colors.accentTeal : node.color;
-      ctx.globalAlpha = isSelected || isHovered || isGrabbed ? (isGrabbed ? 0.3 : 0.2) : 0.1;
+      ctx.globalAlpha = nodeAlpha * (isSelected || isHovered || isGrabbed ? (isGrabbed ? 0.3 : 0.2) : 0.1);
       ctx.fill();
-      ctx.globalAlpha = 1;
+      ctx.globalAlpha = nodeAlpha;
 
       const gradient = ctx.createRadialGradient(node.x, node.y, 0, node.x, node.y, node.size / 2);
       if (colors.isDark) {
@@ -1055,18 +1259,43 @@ export default function KnowledgeGraph() {
       ctx.fillStyle = node.color;
       ctx.fill();
 
-      if (zoom >= 0.8 || isHovered || isSelected) {
-        ctx.globalAlpha = 1;
+      // ── LOD label gating ─────────────────────────────────────────────────
+      const nodeDegree = degreeMap.get(node.id) ?? 0;
+      const isHighDegree = nodeDegree >= p85Degree && nodeDegree >= 2;
+      // Show label if: hovered/selected/grabbed, OR high-degree at reasonable zoom,
+      // OR extreme zoom-in (show everything)
+      const shouldShowLabel =
+        isHovered || isSelected || isGrabbed ||
+        (isHighDegree && zoom >= 0.55) ||
+        zoom >= 2.0;
+
+      if (shouldShowLabel) {
+        const labelY = node.y + node.size / 2 + 18;
+        const labelText = node.label.length > 24 ? node.label.slice(0, 22) + "…" : node.label;
+        const fontSize = isHovered || isSelected ? 13 : 11;
+        ctx.font = `600 ${fontSize}px Inter, sans-serif`;
+        const textWidth = ctx.measureText(labelText).width;
+
+        // ── Pill background so label is always readable ────────────────────
+        const padX = 5, padY = 3;
+        ctx.globalAlpha = nodeAlpha * (isHovered || isSelected ? 0.92 : 0.78);
+        ctx.fillStyle = colors.isDark ? "rgba(13,21,32,0.88)" : "rgba(255,255,255,0.9)";
+        const rr2 = 5;
+        ctx.beginPath();
+        ctx.roundRect(node.x - textWidth / 2 - padX, labelY - fontSize - padY, textWidth + padX * 2, fontSize + padY * 2, rr2);
+        ctx.fill();
+
+        // ── Label text ────────────────────────────────────────────────────
+        ctx.globalAlpha = nodeAlpha;
         ctx.fillStyle = isHovered || isSelected ? colors.textPrimary : colors.textSecondary;
-        ctx.font = `600 ${isHovered || isSelected ? "13px" : "12px"} Inter, sans-serif`;
         ctx.textAlign = "center";
+        ctx.textBaseline = "alphabetic";
 
         if (isHovered || isSelected) {
           ctx.shadowBlur = 4;
-          ctx.shadowColor = colors.isDark ? "rgba(0, 0, 0, 0.5)" : "rgba(255, 255, 255, 0.8)";
+          ctx.shadowColor = colors.isDark ? "rgba(0,0,0,0.6)" : "rgba(255,255,255,0.9)";
         }
-
-        ctx.fillText(node.label, node.x, node.y + node.size / 2 + 20);
+        ctx.fillText(labelText, node.x, labelY);
         ctx.shadowBlur = 0;
       }
     });
@@ -1093,7 +1322,7 @@ export default function KnowledgeGraph() {
 
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
-  }, [nodes, edges, zoom, pan, selectedNode, hoveredNode, colors, draggingNodeId]);
+  }, [displayNodes, displayEdges, zoom, pan, selectedNode, hoveredNode, colors, draggingNodeId]);
 
   // ── Throw physics after node release ────────────────────────────────────────
   const startThrow = (nodeId: string) => {
@@ -1117,39 +1346,14 @@ export default function KnowledgeGraph() {
 
   // ── Force-directed auto-layout ───────────────────────────────────────────────
   const handleForceLayout = () => {
-    setNodes(prev => {
-      const pos = prev.map(n => ({ ...n }));
-      for (let iter = 0; iter < 250; iter++) {
-        // Node-node repulsion
-        for (let i = 0; i < pos.length; i++) {
-          for (let j = i + 1; j < pos.length; j++) {
-            const dx = pos[j].x - pos[i].x || 0.01;
-            const dy = pos[j].y - pos[i].y || 0.01;
-            const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-            const f = 7500 / (dist * dist);
-            pos[i].x -= (dx / dist) * f;
-            pos[i].y -= (dy / dist) * f;
-            pos[j].x += (dx / dist) * f;
-            pos[j].y += (dy / dist) * f;
-          }
-        }
-        // Edge spring attraction
-        edges.forEach(edge => {
-          const s = pos.find(n => n.id === edge.source);
-          const t = pos.find(n => n.id === edge.target);
-          if (!s || !t) return;
-          const dx = t.x - s.x;
-          const dy = t.y - s.y;
-          const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-          const f = (dist - 200) * 0.012;
-          s.x += (dx / dist) * f;
-          s.y += (dy / dist) * f;
-          t.x -= (dx / dist) * f;
-          t.y -= (dy / dist) * f;
-        });
-      }
-      return pos;
-    });
+    const w = containerRef.current?.offsetWidth ?? 1200;
+    const h = containerRef.current?.offsetHeight ?? 800;
+    const positioned = applyForceLayout(displayNodes, displayEdges, w, h);
+    const posMap = new Map(positioned.map(n => [n.id, { x: n.x, y: n.y }]));
+    setNodes(prev => prev.map(n => {
+      const pos = posMap.get(n.id);
+      return pos ? { ...n, ...pos } : n;
+    }));
   };
 
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -1165,7 +1369,7 @@ export default function KnowledgeGraph() {
     const x = (e.clientX - rect.left - pan.x) / zoom;
     const y = (e.clientY - rect.top - pan.y) / zoom;
 
-    const clicked = nodes.find(n =>
+    const clicked = displayNodes.find(n =>
       Math.sqrt((n.x - x) ** 2 + (n.y - y) ** 2) < n.size / 2
     );
 
@@ -1214,7 +1418,7 @@ export default function KnowledgeGraph() {
     }
 
     // ── Hover detection ────────────────────────────────────────────────────
-    const hovered = nodes.find(n =>
+    const hovered = displayNodes.find(n =>
       Math.sqrt((n.x - wx) ** 2 + (n.y - wy) ** 2) < n.size / 2
     );
     setHoveredNode(hovered || null);
@@ -1234,7 +1438,7 @@ export default function KnowledgeGraph() {
         const rect = canvasRef.current!.getBoundingClientRect();
         const x = (e.clientX - rect.left - pan.x) / zoom;
         const y = (e.clientY - rect.top  - pan.y) / zoom;
-        const clicked = nodes.find(n =>
+        const clicked = displayNodes.find(n =>
           Math.sqrt((n.x - x) ** 2 + (n.y - y) ** 2) < n.size / 2 + 5
         );
         setSelectedNode(clicked || null);
@@ -1269,47 +1473,176 @@ export default function KnowledgeGraph() {
   const handleZoomOut = () => setZoom(prev => Math.max(prev - 0.2, 0.5));
   const handleResetView = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
 
-  const filters = ["All", "Concept", "Component", "Process", "System"];
+  // Navigate to Chat with the entity name pre-filled as a question
+  const handleAsk = (label: string) => {
+    navigate(`/?q=${encodeURIComponent(`Tell me about ${label}`)}`);
+  };
+
+  // ── Dynamic entity-type filters from loaded nodes ───────────────────────────
+  const entityTypes = useMemo(() => {
+    const types = [...new Set(nodes.map((n) => n.type))].sort();
+    return ["All", ...types];
+  }, [nodes]);
+
+  // ── Download, Share, Fullscreen ───────────────────────────────────────────
+  const [shareToast, setShareToast] = useState(false);
+
+  const handleDownload = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const link = document.createElement("a");
+    link.download = `knowledge-graph-${Date.now()}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  };
+
+  const handleShare = async () => {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+    } catch {
+      // fallback: prompt
+    }
+    setShareToast(true);
+    setTimeout(() => setShareToast(false), 2000);
+  };
+
+  const handleFullscreen = () => {
+    const el = containerRef.current?.parentElement as HTMLElement | null;
+    if (!el) return;
+    if (!document.fullscreenElement) {
+      el.requestFullscreen?.();
+    } else {
+      document.exitFullscreen?.();
+    }
+  };
 
   return (
     <div className="h-full flex flex-col bg-background">
-      {/* Toolbar */}
-      <div className="h-16 flex items-center justify-between px-6 border-b border-border bg-surface/50 backdrop-blur-sm">
-        <div className="flex items-center gap-4 flex-1">
-          <div className="relative w-80">
+      {/* Toolbar — position:relative + high z-index so dropdowns render above canvas */}
+      <div
+        className="h-16 flex items-center justify-between px-6 border-b border-border bg-surface/50 backdrop-blur-sm"
+        style={{ position: "relative", zIndex: 100 }}
+      >
+        <div className="flex items-center gap-3 flex-1" style={{ minWidth: 0 }}>
+          {/* Search */}
+          <div className="relative w-72 flex-shrink-0">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-text-tertiary" size={16} />
             <input
               type="text"
               placeholder="Search entities..."
-              className="w-full h-10 pl-10 pr-4 rounded-lg bg-elevated border border-border text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent-teal/50 transition-all"
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              className="w-full h-9 pl-9 pr-3 rounded-lg bg-elevated border border-border text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent-teal/50 transition-all text-sm"
             />
           </div>
 
-          <div className="flex items-center gap-2">
-            {filters.map(filter => (
+          {/* Document source picker — uses actual Neo4j source names so the filter matches */}
+          {neo4jSources.length > 0 && (
+            <div className="relative flex-shrink-0">
+              <button
+                onClick={() => setSourcePickerOpen((o) => !o)}
+                className="flex items-center gap-2 h-9 px-3 rounded-lg border transition-colors"
+                style={{
+                  background: selectedSource ? "rgba(0,217,192,0.1)" : "var(--elevated)",
+                  border: selectedSource ? "1px solid var(--accent-teal)" : "1px solid var(--border)",
+                  color: selectedSource ? "var(--accent-teal)" : "var(--text-secondary)",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: "11.5px",
+                  maxWidth: "200px",
+                  cursor: "pointer",
+                }}
+              >
+                <span className="truncate">
+                  {selectedSource ? cleanSourceName(selectedSource, indexedDocs) : "All documents"}
+                </span>
+                <ChevronDown size={12} className="flex-shrink-0" />
+              </button>
+              {sourcePickerOpen && (
+                <div
+                  className="absolute top-full mt-1 left-0 rounded-lg shadow-xl overflow-hidden"
+                  style={{
+                    background: "var(--elevated)",
+                    border: "1px solid var(--border)",
+                    minWidth: "240px",
+                    zIndex: 200,
+                    boxShadow: "0 8px 32px rgba(0,0,0,0.28)",
+                  }}
+                >
+                  <button
+                    className="w-full text-left px-3 py-2.5 text-[12px] transition-colors hover:bg-surface"
+                    style={{ fontFamily: "var(--font-mono)", color: !selectedSource ? "var(--accent-teal)" : "var(--text-primary)", cursor: "pointer" }}
+                    onClick={() => { setSelectedSource(null); setSourcePickerOpen(false); }}
+                  >
+                    All documents
+                  </button>
+                  {neo4jSources.map((src) => (
+                    <button
+                      key={src}
+                      className="w-full text-left px-3 py-2.5 text-[12px] transition-colors hover:bg-surface"
+                      style={{
+                        fontFamily: "var(--font-mono)",
+                        color: selectedSource === src ? "var(--accent-teal)" : "var(--text-primary)",
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block",
+                        cursor: "pointer",
+                      }}
+                      onClick={() => { setSelectedSource(src); setSourcePickerOpen(false); }}
+                    >
+                      {cleanSourceName(src, indexedDocs)}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Node limit picker */}
+          <div className="relative flex-shrink-0">
+            <select
+              value={nodeLimit}
+              onChange={e => setNodeLimit(Number(e.target.value))}
+              title="Max nodes to display"
+              style={{
+                height: "36px",
+                paddingLeft: "10px",
+                paddingRight: "28px",
+                borderRadius: "8px",
+                background: "var(--elevated)",
+                border: "1px solid var(--border)",
+                color: "var(--text-secondary)",
+                fontFamily: "var(--font-mono)",
+                fontSize: "11.5px",
+                cursor: "pointer",
+                appearance: "none",
+                WebkitAppearance: "none",
+              }}
+            >
+              {NODE_LIMIT_OPTIONS.map(n => (
+                <option key={n} value={n}>{n === 2000 ? "All" : `${n} nodes`}</option>
+              ))}
+            </select>
+            <ChevronDown size={11} style={{ position: "absolute", right: "8px", top: "50%", transform: "translateY(-50%)", pointerEvents: "none", color: "var(--text-tertiary)" }} />
+          </div>
+
+          {/* Entity type filters — derived from loaded nodes, horizontally scrollable */}
+          <div
+            className="flex items-center gap-1.5"
+            style={{ overflowX: "auto", overflowY: "visible", scrollbarWidth: "none", flexShrink: 1, minWidth: 0 }}
+          >
+            {entityTypes.map(filter => (
               <button
                 key={filter}
                 onClick={() => setActiveFilter(filter)}
-                className="px-3 h-9 rounded-lg text-sm font-medium transition-all"
+                className="px-3 h-8 rounded-lg text-xs font-medium transition-all flex-shrink-0"
                 style={{
                   background: activeFilter === filter ? "var(--accent-teal)" : "transparent",
                   color: activeFilter === filter ? "#FFFFFF" : "var(--text-secondary)",
                   border: activeFilter === filter ? "none" : "1px solid var(--border)",
                   fontWeight: activeFilter === filter ? 600 : 500,
                   boxShadow: activeFilter === filter ? "0 2px 8px rgba(0, 217, 192, 0.3)" : "none",
+                  cursor: "pointer",
                 }}
-                onMouseEnter={e => {
-                  if (activeFilter !== filter) {
-                    e.currentTarget.style.color = "var(--text-primary)";
-                    e.currentTarget.style.borderColor = "var(--border-hover)";
-                  }
-                }}
-                onMouseLeave={e => {
-                  if (activeFilter !== filter) {
-                    e.currentTarget.style.color = "var(--text-secondary)";
-                    e.currentTarget.style.borderColor = "var(--border)";
-                  }
-                }}
+                onMouseEnter={e => { if (activeFilter !== filter) { e.currentTarget.style.color = "var(--text-primary)"; e.currentTarget.style.borderColor = "var(--border-hover)"; } }}
+                onMouseLeave={e => { if (activeFilter !== filter) { e.currentTarget.style.color = "var(--text-secondary)"; e.currentTarget.style.borderColor = "var(--border)"; } }}
               >
                 {filter}
               </button>
@@ -1317,21 +1650,25 @@ export default function KnowledgeGraph() {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button onClick={handleZoomOut} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Zoom out">
-            <ZoomOut size={18} />
-          </button>
-          <button onClick={handleZoomIn} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Zoom in">
-            <ZoomIn size={18} />
-          </button>
-          <button onClick={handleResetView} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Reset view">
-            <Maximize2 size={18} />
+        {/* Right-side controls */}
+        <div className="flex items-center gap-1 flex-shrink-0 ml-3">
+          <button onClick={handleZoomOut} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Zoom out"><ZoomOut size={17} /></button>
+          <button onClick={handleZoomIn} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Zoom in"><ZoomIn size={17} /></button>
+          <button onClick={handleResetView} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Fit to screen"><Maximize2 size={17} /></button>
+          <div className="w-px h-6 bg-border mx-1" />
+          <button onClick={handleFullscreen} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Toggle fullscreen"><Layers size={17} /></button>
+          <button onClick={handleDownload} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Download as PNG"><Download size={17} /></button>
+          <button
+            onClick={handleShare}
+            className="p-2 rounded-lg transition-all"
+            title="Copy link"
+            style={{ color: shareToast ? "var(--accent-teal)" : "var(--text-secondary)" }}
+          >
+            {shareToast ? <Check size={17} /> : <Share2 size={17} />}
           </button>
           <div className="w-px h-6 bg-border mx-1" />
-          <button className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all"><Layers size={18} /></button>
-          <button className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all"><Download size={18} /></button>
-          <button className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all"><Share2 size={18} /></button>
-          <button onClick={handleForceLayout} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Auto-arrange nodes (force layout)"><Shuffle size={18} /></button>
+          <button onClick={handleForceLayout} className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all" title="Auto-arrange (force layout)"><Shuffle size={17} /></button>
+          <button onClick={() => setRefreshKey((k) => k + 1)} className={`p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-all ${isLoading ? "animate-spin" : ""}`} title="Refresh graph"><RefreshCw size={17} /></button>
         </div>
       </div>
 
@@ -1352,20 +1689,81 @@ export default function KnowledgeGraph() {
           <div className="text-xs font-mono text-text-secondary">Zoom: {Math.round(zoom * 100)}%</div>
         </div>
 
-        {/* Stats overlay */}
+        {/* Stats overlay — all figures sourced from Neo4j */}
         <div className="absolute top-4 left-4 px-4 py-3 rounded-lg bg-elevated/90 backdrop-blur-sm border border-border shadow-lg">
-          <div className="flex items-center gap-6">
+          <div className="flex items-center gap-5">
+            {/* Entities: showing X of Y KB-total */}
             <div>
-              <div className="text-xs text-text-tertiary mb-1">Nodes</div>
-              <div className="text-lg font-semibold text-text-primary">{nodes.length}</div>
+              <div className="text-xs text-text-tertiary mb-1" style={{ fontFamily: "var(--font-mono)", letterSpacing: "0.06em", textTransform: "uppercase" }}>Entities</div>
+              <div className="text-lg font-semibold text-text-primary" style={{ fontFamily: "var(--font-display)", letterSpacing: "-0.02em" }}>
+                {displayNodes.length}
+                {kbStats && (
+                  <span className="text-xs font-normal text-text-tertiary ml-1.5">
+                    / {kbStats.total_entities.toLocaleString()} total
+                  </span>
+                )}
+              </div>
             </div>
-            <div className="w-px h-10 bg-border" />
+            <div className="w-px h-9 bg-border" />
+            {/* Relationships */}
             <div>
-              <div className="text-xs text-text-tertiary mb-1">Connections</div>
-              <div className="text-lg font-semibold text-text-primary">{edges.length}</div>
+              <div className="text-xs text-text-tertiary mb-1" style={{ fontFamily: "var(--font-mono)", letterSpacing: "0.06em", textTransform: "uppercase" }}>Relations</div>
+              <div className="text-lg font-semibold text-text-primary" style={{ fontFamily: "var(--font-display)", letterSpacing: "-0.02em" }}>
+                {displayEdges.length}
+                {kbStats && (
+                  <span className="text-xs font-normal text-text-tertiary ml-1.5">
+                    / {kbStats.total_relations.toLocaleString()} total
+                  </span>
+                )}
+              </div>
             </div>
+            {kbStats && (
+              <>
+                <div className="w-px h-9 bg-border" />
+                {/* Documents */}
+                <div>
+                  <div className="text-xs text-text-tertiary mb-1" style={{ fontFamily: "var(--font-mono)", letterSpacing: "0.06em", textTransform: "uppercase" }}>Documents</div>
+                  <div className="text-lg font-semibold text-text-primary" style={{ fontFamily: "var(--font-display)", letterSpacing: "-0.02em" }}>
+                    {kbStats.total_documents}
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </div>
+
+        {/* Density warning */}
+        {!isLoading && displayNodes.length > 200 && (
+          <div
+            className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 rounded-lg text-[12px] pointer-events-none"
+            style={{
+              background: "rgba(255, 180, 0, 0.1)",
+              border: "1px solid rgba(255, 180, 0, 0.35)",
+              color: "rgba(255, 180, 0, 0.9)",
+              fontFamily: "var(--font-mono)",
+              backdropFilter: "blur(8px)",
+              zIndex: 10,
+            }}
+          >
+            <span style={{ fontSize: 14 }}>⚠</span>
+            {displayNodes.length} nodes — filter by document or entity type for clarity
+          </div>
+        )}
+
+        {/* Empty state */}
+        {!isLoading && nodes.length === 0 && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 pointer-events-none">
+            <div className="text-[14px]" style={{ color: "var(--text-tertiary)", fontFamily: "var(--font-mono)" }}>No graph data yet</div>
+            <div className="text-[12px]" style={{ color: "var(--text-tertiary)", fontFamily: "var(--font-mono)" }}>Ingest a document to see entities here</div>
+            <button
+              className="mt-3 px-4 py-2 rounded-lg text-[12px] pointer-events-auto"
+              style={{ background: "var(--accent-teal)", color: "#fff", fontFamily: "var(--font-mono)" }}
+              onClick={() => setRefreshKey((k) => k + 1)}
+            >
+              Refresh
+            </button>
+          </div>
+        )}
 
         {/* Node Inspector */}
         {selectedNode && (
@@ -1375,6 +1773,8 @@ export default function KnowledgeGraph() {
             edges={edges}
             onClose={() => setSelectedNode(null)}
             onNavigate={setSelectedNode}
+            indexedDocs={indexedDocs}
+            onAsk={handleAsk}
           />
         )}
       </div>

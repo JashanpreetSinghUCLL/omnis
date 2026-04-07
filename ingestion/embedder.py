@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ingestion.chunker import Chunk
+from ingestion.embed_config import LOCAL_EMBED_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -96,11 +97,19 @@ async def _embed_voyage(texts: list[str], api_key: str) -> list[list[float]]:
 
 # ── BGE-M3 via fastembed (sync, run in executor) ──────────────────────────────
 
+_bge_model: "TextEmbedding | None" = None  # module-level singleton
+
+
+def _get_bge_model() -> "TextEmbedding":
+    global _bge_model
+    if _bge_model is None:
+        from fastembed import TextEmbedding  # type: ignore[import-untyped]
+        _bge_model = TextEmbedding(LOCAL_EMBED_MODEL)
+    return _bge_model
+
 
 def _embed_bge_sync(texts: list[str]) -> list[list[float]]:
-    from fastembed import TextEmbedding  # type: ignore[import-untyped]
-
-    model = TextEmbedding("BAAI/bge-large-en-v1.5")
+    model = _get_bge_model()
     return [v.tolist() for v in model.embed(texts)]
 
 
@@ -124,7 +133,7 @@ async def embed_chunks(
 
     Hits the Redis cache first; only sends uncached chunks to the API.
     """
-    model_tag = _VOYAGE_DOC_MODEL if voyage_api_key else "bge-large-en-v1.5"
+    model_tag = _VOYAGE_DOC_MODEL if voyage_api_key else LOCAL_EMBED_MODEL
 
     # Phase 1: resolve cache
     results: list[list[float] | None] = [None] * len(chunks)

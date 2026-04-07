@@ -27,6 +27,7 @@ from typing import Any
 from uuid import UUID
 
 from ingestion.embedder import EmbeddedChunk
+from ingestion.embed_config import LOCAL_EMBED_MODEL, LOCAL_EMBED_DIMS
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +35,10 @@ logger = logging.getLogger(__name__)
 _SPARSE_BUCKET_BITS = 20
 _SPARSE_BUCKET_SIZE = 2**_SPARSE_BUCKET_BITS
 
-# voyage-4-large → 2048 dims.  BGE-M3 → 1024 dims.  We infer at runtime.
+# voyage-4-large → 2048 dims.  Local fallback → LOCAL_EMBED_DIMS.  Inferred at runtime.
 _DENSE_DIMS: dict[str, int] = {
     "voyage-4-large": 2048,
-    "bge-large-en-v1.5": 1024,
+    LOCAL_EMBED_MODEL: LOCAL_EMBED_DIMS,
 }
 
 

@@ -31,6 +31,7 @@ export type GraphStreamEvent = ApiGraphNode | ApiGraphEdge | ApiGraphDone;
 export interface GraphExploreParams {
   tenant_id?: string;
   entity_type?: string;
+  source?: string;
   depth?: number;
   limit?: number;
   cursor?: string;
@@ -43,9 +44,11 @@ export interface GraphExploreParams {
 export async function* streamGraphExplore(
   params: GraphExploreParams = {},
 ): AsyncGenerator<GraphStreamEvent> {
-  const url = new URL(`${getApiBaseUrl()}/v1/graph/explore`);
+  const base = getApiBaseUrl();
+  const url = new URL(`${base}/v1/graph/explore`, base || window.location.href);
   if (params.tenant_id) url.searchParams.set("tenant_id", params.tenant_id);
   if (params.entity_type) url.searchParams.set("entity_type", params.entity_type);
+  if (params.source) url.searchParams.set("source", params.source);
   if (params.depth != null) url.searchParams.set("depth", String(params.depth));
   if (params.limit != null) url.searchParams.set("limit", String(params.limit));
   if (params.cursor) url.searchParams.set("cursor", params.cursor);

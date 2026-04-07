@@ -30,10 +30,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Port 8000 is NOT exposed to the host — nginx proxies /v1/* internally.
-    # Uncomment the line below only for direct API access during debugging.
-    # ports:
-    #   - "8000:8000"
+    # Port 8000 exposed for local dev (pnpm dev hits localhost:8000 directly).
+    # nginx proxies /v1/* internally in Docker so both paths work.
+    ports:
+      - "8000:8000"
+    volumes:
+      - ingest_tmp:/ingest_tmp
+      - hf_cache:/tmp/fastembed_cache
     environment:
       <<: *app-env
       LANGFUSE_HOST: http://langfuse:3000
@@ -65,8 +68,12 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
+    volumes:
+      - ingest_tmp:/ingest_tmp
+      - hf_cache:/tmp/fastembed_cache
     environment:
       <<: *app-env
+      HF_TOKEN: ${HF_TOKEN:-}
 
   # Frontend (Vite build served by Nginx)
   ui:
@@ -74,7 +81,9 @@ services:
       context: ./omnis-ui
       dockerfile: Dockerfile
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+        # Empty string → same-origin → nginx proxies /v1/* and /api/* to api:8000 internally.
+        # Override with VITE_API_BASE_URL=http://myhost:8000 only when nginx is not in the path.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
         VITE_WS_BASE_URL: ${VITE_WS_BASE_URL:-}
     container_name: omnis-ui
     restart: unless-stopped
@@ -246,6 +255,8 @@ services:
       start_period: 60s
 
 volumes:
+  ingest_tmp:
+  hf_cache:
   qdrant_data:
   neo4j_data:
   neo4j_logs:

@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field
 
 class IngestResponse(BaseModel):
     job_id: str = Field(..., description="UUID4 task identifier")
-    status: Literal["queued"] = "queued"
+    status: Literal["queued", "skipped"] = "queued"
+    skipped: bool = False
     message: str = "Document queued for ingestion"
 
 

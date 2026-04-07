@@ -19,6 +19,7 @@ class AgentState(TypedDict):
     question: str
     session_id: str
     tenant_id: str
+    force_model: str | None  # optional user-selected model override
 
     # ── Routing
     route: Literal["researcher", "coder"] | None  # set by classifier_node
@@ -37,3 +38,6 @@ class AgentState(TypedDict):
     errors: list[str]  # reviewer critique; passed to coder on retry
     faithfulness_score: float | None
     retry_count: int  # hard ceiling enforced in graph.py: MAX_RETRIES = 3
+
+    # ── Per-node timing (ms) — written by each node, read by the SSE route
+    latency_ms: float | None

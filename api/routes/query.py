@@ -11,6 +11,7 @@ from functools import cache
 from fastapi import APIRouter, HTTPException
 
 from agents.graph import build_graph
+from ingestion.embed_config import LOCAL_EMBED_MODEL
 from agents.memory import GraphitiMemory
 from agents.nodes import EmbedFn
 from api.config import Settings, get_settings
@@ -49,7 +50,7 @@ def _make_embed_fn(voyage_key: str | None) -> EmbedFn:
 
         from fastembed import TextEmbedding  # type: ignore[import-untyped]
 
-        _model = TextEmbedding("BAAI/bge-large-en-v1.5")
+        _model = TextEmbedding(LOCAL_EMBED_MODEL)
 
         def _embed_sync(text: str) -> list[float]:
             vecs = list(_model.embed([text]))
@@ -59,7 +60,7 @@ def _make_embed_fn(voyage_key: str | None) -> EmbedFn:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, _embed_sync, text)
 
-        logger.info("Query embedder: fastembed bge-large-en-v1.5 (Voyage key absent)")
+        logger.info("Query embedder: fastembed %s (Voyage key absent)", LOCAL_EMBED_MODEL)
         return _bge_embed
 
 
@@ -139,6 +140,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         "question": req.question,
         "session_id": req.session_id,
         "tenant_id": req.tenant_id,
+        "force_model": None,
         "route": None,
         "model_used": "",
         "context": [],

@@ -1,20 +1,25 @@
 # syntax=docker/dockerfile:1
 FROM node:20-alpine AS builder
 
+# Enable corepack so pnpm is available without a separate install step
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
 WORKDIR /app
 
-COPY package*.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci
+COPY package.json pnpm-lock.yaml ./
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
 
 COPY . .
 
-ARG VITE_API_BASE_URL=http://localhost:8000
+# Default to empty string → same-origin → nginx proxies /v1/* to api:8000.
+# Override VITE_API_BASE_URL only when nginx is not in the request path.
+ARG VITE_API_BASE_URL=
 ARG VITE_WS_BASE_URL=
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 ENV VITE_WS_BASE_URL=${VITE_WS_BASE_URL}
 
-RUN npm run build
+RUN pnpm run build
 
 FROM nginx:1.27-alpine
 

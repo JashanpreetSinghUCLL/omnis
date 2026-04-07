@@ -20,6 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from ingestion.embed_config import LOCAL_EMBED_MODEL
+
 logger = logging.getLogger(__name__)
 
 # ── Constants
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 _VECTOR_INDEX = "chunk_embeddings"
 
 # Same model used during graph ingestion (graph_builder._make_fastembed_embedder).
-_EMBED_MODEL = "BAAI/bge-large-en-v1.5"
+_EMBED_MODEL = LOCAL_EMBED_MODEL
 
 # Top-k chunks to retrieve from the vector index before expansion.
 _DEFAULT_TOP_K = 10

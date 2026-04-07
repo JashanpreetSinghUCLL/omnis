@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from ingestion.embed_config import LOCAL_EMBED_MODEL
 from rich.columns import Columns
 from rich.console import Console
 from rich.live import Live
@@ -308,7 +309,7 @@ def _make_embed_fn_cli(voyage_key: str | None) -> Any:
 
     from fastembed import TextEmbedding  # type: ignore[import-untyped]
 
-    model = TextEmbedding("BAAI/bge-large-en-v1.5")
+    model = TextEmbedding(LOCAL_EMBED_MODEL)
 
     async def _bge(text: str) -> list[float]:
         loop = asyncio.get_running_loop()

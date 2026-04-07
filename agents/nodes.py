@@ -123,15 +123,24 @@ def make_classifier_node() -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
 
     @safe_observe(name="classifier")
     async def classifier_node(state: AgentState) -> dict[str, Any]:
+        t0 = time.perf_counter()
         decision: ModelRoute = route_question(state["question"])
 
+        # User-selected model override: keep the route but swap the model
+        force = state.get("force_model")
+        if force and force in ("claude-haiku-3-5", "claude-sonnet-4", "claude-opus-4"):
+            model_id = force
+        else:
+            model_id = decision.model_id
+
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         try_update_observation(
             input={"question": state["question"]},
-            output={"route": decision.route, "model_id": decision.model_id},
-            metadata={"tenant_id": state.get("tenant_id"), "session_id": state.get("session_id")},
+            output={"route": decision.route, "model_id": model_id},
+            metadata={"tenant_id": state.get("tenant_id"), "session_id": state.get("session_id"), "latency_ms": latency_ms},
         )
 
-        return {"route": decision.route, "model_used": decision.model_id}
+        return {"route": decision.route, "model_used": model_id, "latency_ms": latency_ms}
 
     return classifier_node
 
@@ -193,6 +202,7 @@ def make_researcher_node(
                 "source": c["source"],
                 "chunk_id": c["chunk_id"],
                 "score": c["score"],
+                "text": c.get("text", ""),
             }
             for i, c in enumerate(context)
         ]
@@ -261,7 +271,7 @@ def make_researcher_node(
             cost,
             _preview(answer),
         )
-        return {"context": context, "citations": citations, "final_answer": answer}
+        return {"context": context, "citations": citations, "final_answer": answer, "latency_ms": latency_ms}
 
     return researcher_node
 
@@ -366,8 +376,8 @@ def make_coder_node(
         )
 
         if route == "coder":
-            return {"code_snippet": generated, "retry_count": new_retry}
-        return {"final_answer": generated, "retry_count": new_retry}
+            return {"code_snippet": generated, "retry_count": new_retry, "latency_ms": latency_ms}
+        return {"final_answer": generated, "retry_count": new_retry, "latency_ms": latency_ms}
 
     return coder_node
 
@@ -503,9 +513,9 @@ def make_reviewer_node(
             final = state.get("final_answer") or output
             if state.get("route") == "coder":
                 final = output
-            return {"faithfulness_score": score, "errors": [], "final_answer": final}
+            return {"faithfulness_score": score, "errors": [], "final_answer": final, "latency_ms": latency_ms}
 
-        return {"faithfulness_score": score, "errors": issues}
+        return {"faithfulness_score": score, "errors": issues, "latency_ms": latency_ms}
 
     return reviewer_node
 

@@ -31,6 +31,7 @@ class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     session_id: str = Field(default="default")
     tenant_id: str = Field(default="default")
+    model: str | None = Field(default=None, description="Force a specific model: claude-haiku-3-5 | claude-sonnet-4 | claude-opus-4")
 
 
 # ── SSE event payloads
@@ -61,6 +62,7 @@ class CitationEvent(BaseModel):
     source: str
     chunk_id: str | None = None
     score: float | None = None
+    text: str | None = None
 
 
 class CacheHitEvent(BaseModel):

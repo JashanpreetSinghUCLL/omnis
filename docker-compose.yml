@@ -191,7 +191,7 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - langfuse_clickhouse_data:/var/lib/clickhouse
-      - ./docker/clickhouse/config.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      - ./docker/clickhouse/config.xml:/etc/clickhouse-server/config.d/keeper.xml
     healthcheck:
       test:
         [
